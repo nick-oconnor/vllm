@@ -262,6 +262,9 @@ class MiniMaxM3MoE(nn.Module):
             router_logits_dtype=self.gate.out_dtype,
             shared_experts=self.shared_experts,
             quant_config=quant_config,
+            # Match the checkpoint's per-expert weight names so ModelOpt NVFP4
+            # resolves the fused experts (else they load unquantized -> OOM).
+            ckpt_names=("w1", "w2", "w3"),
             prefix=f"{prefix}.experts",
         )
 

@@ -298,8 +298,15 @@ class MinimaxM3ToolParser(RustToolParser):
     ):
         if _TOOL_CALL_OPEN in current_text:
             delta_text = _MISSING_NS_RE.sub(_NS + r"\1", delta_text)
+            # The per-delta lookbehind cannot see a namespace marker that
+            # arrived in an earlier delta (the marker is its own token), so it
+            # re-adds one and produces a doubled ]<]minimax[>[]<]minimax[>[
+            # prefix the Rust parser rejects. Drop the duplicate straddling the
+            # delta boundary.
+            if previous_text.endswith(_NS) and delta_text.startswith(_NS):
+                delta_text = delta_text[len(_NS) :]
 
-        return super().extract_tool_calls_streaming(
+        delta = super().extract_tool_calls_streaming(
             previous_text,
             current_text,
             delta_text,
@@ -308,3 +315,13 @@ class MinimaxM3ToolParser(RustToolParser):
             delta_token_ids,
             request,
         )
+
+        # The ]<]minimax[>[ namespace marker prefixes every tool-call tag and is
+        # never valid assistant content. The incremental parser can surface it
+        # as a content delta before the following <tool_call> token promotes it
+        # to a tool call; strip it so it never leaks into the streamed output.
+        if delta is not None and delta.content and _NS in delta.content:
+            cleaned = delta.content.replace(_NS, "")
+            delta.content = cleaned or None
+
+        return delta

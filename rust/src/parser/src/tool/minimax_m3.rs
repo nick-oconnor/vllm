@@ -1,5 +1,5 @@
 use winnow::ascii::{multispace0 as ws0, multispace1 as ws1};
-use winnow::combinator::{alt, delimited, seq};
+use winnow::combinator::{alt, delimited, opt, seq};
 use winnow::error::{ContextError, ErrMode};
 use winnow::prelude::*;
 use winnow::stream::Partial;
@@ -12,6 +12,9 @@ use crate::tool::Tool;
 
 const NAMESPACE: &str = "]<]minimax[>[";
 const TOOL_CALL_START: &str = "]<]minimax[>[<tool_call>";
+// Only the tests build a well-formed close with the namespace prefix; the
+// parser now matches the close via NAMESPACE + "</tool_call>" (prefix optional).
+#[cfg(test)]
 const TOOL_CALL_END: &str = "]<]minimax[>[</tool_call>";
 const INVOKE_START: &str = "]<]minimax[>[<invoke";
 const INVOKE_END: &str = "]<]minimax[>[</invoke>";
@@ -219,8 +222,15 @@ fn parse_tool_block_event(
 }
 
 /// Parse a MiniMax M3 tool-block end marker.
+///
+/// The model intermittently drops the `]<]minimax[>[` namespace prefix on the
+/// closing tag. In streaming the bare `</tool_call>` arrives split across token
+/// deltas, so the Python-side per-delta namespace normalisation cannot repair
+/// it and the strict marker match would fail the whole tool call. Accept the
+/// close with or without the prefix so a bare `</tool_call>` still ends the
+/// block cleanly.
 fn tool_block_end_event(input: &mut MinimaxM3Input<'_>) -> ModalResult<MinimaxM3Event> {
-    (ws0, literal(TOOL_CALL_END))
+    (ws0, opt(literal(NAMESPACE)), literal("</tool_call>"))
         .value(MinimaxM3Event::ToolBlockEnd)
         .parse_next(input)
 }
@@ -705,6 +715,44 @@ mod tests {
             serde_json::from_str::<Value>(&output.calls()[0].arguments).unwrap(),
             json!({ "city": "Seattle" })
         );
+    }
+
+    #[test]
+    fn minimax_m3_streaming_tolerates_bare_tool_call_close() {
+        // The model sometimes drops the namespace prefix on the closing tag,
+        // emitting a bare `</tool_call>`. It must still end the block and keep
+        // the already-parsed call instead of failing the whole tool call.
+        let mut parser = MinimaxM3ToolParser::new(&m3_test_tools());
+        let output = collect_stream(
+            &mut parser,
+            &[
+                TOOL_CALL_START,
+                &invoke("get_weather", &element("city", "Seattle")),
+                "\n</tool_call>",
+            ],
+        );
+
+        assert!(output.normal_text().is_empty());
+        assert_eq!(output.calls().len(), 1);
+        assert_eq!(output.calls()[0].name.as_deref(), Some("get_weather"));
+        assert_eq!(
+            serde_json::from_str::<Value>(&output.calls()[0].arguments).unwrap(),
+            json!({ "city": "Seattle" })
+        );
+    }
+
+    #[test]
+    fn minimax_m3_parse_complete_tolerates_bare_tool_call_close() {
+        let mut parser = MinimaxM3ToolParser::new(&m3_test_tools());
+        let output = parser
+            .parse_complete(&format!(
+                "{TOOL_CALL_START}\n{}\n</tool_call>",
+                invoke("get_weather", &element("city", "Seattle"))
+            ))
+            .unwrap();
+
+        assert_eq!(output.calls().len(), 1);
+        assert_eq!(output.calls()[0].name.as_deref(), Some("get_weather"));
     }
 
     #[test]
