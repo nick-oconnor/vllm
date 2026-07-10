@@ -148,6 +148,38 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
 
     use_persistent_cache = True
 
+    # Optional cross-rank tactic sync (FlashInfer PR #3187 / `2c0d595f`).
+    # When enabled, FlashInfer's autotuner all-reduces measured timings
+    # across the TP group before argmin, so every rank picks the same tactic.
+    # Fixes the per-rank-tactic-divergence class of bugs (Xid-69 on long
+    # context, see sm120-enablement/notes/incident-longcontext-xid69.md).
+    #
+    # IMPORTANT: PR #3187's _profile_single_kernel does an all-reduce that
+    # requires ALL ranks to be inside the autotune context simultaneously.
+    # vLLM's default autotune is leader-only (rank 0 writes the cache,
+    # others read it). When sync is on, we must force all ranks to enter
+    # the autotune context, otherwise the leader deadlocks waiting for
+    # non-leaders that never call _profile_single_kernel.
+    _autotune_all_ranks = False
+    _pg_set = False
+    if (
+        envs.VLLM_FLASHINFER_AUTOTUNE_PROCESS_GROUP
+        and fi_utils.has_flashinfer_autotune_process_group()
+    ):
+        try:
+            from vllm.distributed.parallel_state import get_tp_group
+
+            fi_utils.set_autotune_process_group(get_tp_group().cpu_group)
+            _pg_set = True
+            _autotune_all_ranks = True
+        except Exception as e:  # noqa: BLE001 — best-effort opt-in
+            logger.warning(
+                "FlashInfer autotune process-group sync could not be "
+                "enabled (%s: %s); falling back to leader-only autotune.",
+                type(e).__name__,
+                e,
+            )
+
     deepep_a2a_backends = {
         "deepep_high_throughput",
         "deepep_low_latency",
@@ -187,7 +219,11 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     )
 
     with torch.inference_mode():
-        if is_leader:
+        # When VLLM_FLASHINFER_AUTOTUNE_PROCESS_GROUP is set, all ranks
+        # must enter the autotune context (see _autotune_all_ranks comment
+        # above); the cross-rank tactic sync's all-reduce deadlocks if
+        # only the leader participates.
+        if is_leader or _autotune_all_ranks:
             with fi_utils.autotune(tune_mode=True, cache=str(cache_path)):
                 runner._dummy_run(**dummy_run_kwargs)
         else:
@@ -218,3 +254,8 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
             world.rank_in_group,
             cache_path,
         )
+
+    # Reset the autotune process-group hook so it doesn't leak into later
+    # unrelated autotune runs (e.g. dynamic autotune on subsequent requests).
+    if _pg_set:
+        fi_utils.set_autotune_process_group(None)

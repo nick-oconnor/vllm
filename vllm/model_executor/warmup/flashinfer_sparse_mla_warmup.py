@@ -127,34 +127,72 @@ def _run_flashinfer_sparse_mla_decode_autotune(
             cache_path,
         )
 
-    with torch.inference_mode():
-        warmup_executed = True
-        if is_leader:
-            if _uses_v2_model_runner(runner) and runner.max_num_reqs >= 2:
-                v2_runner = cast("V2GPUModelRunner", runner)
-                warmup_executed = run_mixed_prefill_decode_warmup(
-                    v2_runner,
-                    worker.execute_model,
-                    worker.sample_tokens,
-                    num_tokens,
-                    mixed_step_context=flashinfer_autotune(True, cache=str(cache_path)),
-                    req_id_prefix="_sparse_mla_v2_warmup",
-                )
+    # Optional cross-rank tactic sync (FlashInfer PR #3187 / `2c0d595f`).
+    # Same fix as kernel_warmup.flashinfer_autotune; opt-in via
+    # VLLM_FLASHINFER_AUTOTUNE_PROCESS_GROUP. See incident-longcontext-xid69.md.
+    #
+    # IMPORTANT: PR #3187's _profile_single_kernel does an all-reduce that
+    # requires ALL ranks to be inside the autotune context simultaneously;
+    # the leader-only pattern below deadlocks if sync is on without
+    # expanding the autotune context to every rank.
+    import vllm.utils.flashinfer as fi_utils
+    import vllm.envs as envs
+
+    _autotune_all_ranks = False
+    _pg_set = False
+    if (
+        envs.VLLM_FLASHINFER_AUTOTUNE_PROCESS_GROUP
+        and fi_utils.has_flashinfer_autotune_process_group()
+    ):
+        try:
+            from vllm.distributed.parallel_state import get_tp_group
+
+            fi_utils.set_autotune_process_group(get_tp_group().cpu_group)
+            _pg_set = True
+            _autotune_all_ranks = True
+        except Exception as e:  # noqa: BLE001 — best-effort opt-in
+            logger.warning(
+                "FlashInfer autotune process-group sync could not be "
+                "enabled for SM120 sparse MLA decode autotune "
+                "(%s: %s); falling back to leader-only.",
+                type(e).__name__,
+                e,
+            )
+
+    try:
+        with torch.inference_mode():
+            warmup_executed = True
+            if is_leader or _autotune_all_ranks:
+                if _uses_v2_model_runner(runner) and runner.max_num_reqs >= 2:
+                    v2_runner = cast("V2GPUModelRunner", runner)
+                    warmup_executed = run_mixed_prefill_decode_warmup(
+                        v2_runner,
+                        worker.execute_model,
+                        worker.sample_tokens,
+                        num_tokens,
+                        mixed_step_context=flashinfer_autotune(
+                            True, cache=str(cache_path)
+                        ),
+                        req_id_prefix="_sparse_mla_v2_warmup",
+                    )
+                else:
+                    with flashinfer_autotune(True, cache=str(cache_path)):
+                        runner._dummy_run(**dummy_run_kwargs)
             else:
-                with flashinfer_autotune(True, cache=str(cache_path)):
+                if _uses_v2_model_runner(runner) and runner.max_num_reqs >= 2:
+                    v2_runner = cast("V2GPUModelRunner", runner)
+                    warmup_executed = run_mixed_prefill_decode_warmup(
+                        v2_runner,
+                        worker.execute_model,
+                        worker.sample_tokens,
+                        num_tokens,
+                        req_id_prefix="_sparse_mla_v2_warmup",
+                    )
+                else:
                     runner._dummy_run(**dummy_run_kwargs)
-        else:
-            if _uses_v2_model_runner(runner) and runner.max_num_reqs >= 2:
-                v2_runner = cast("V2GPUModelRunner", runner)
-                warmup_executed = run_mixed_prefill_decode_warmup(
-                    v2_runner,
-                    worker.execute_model,
-                    worker.sample_tokens,
-                    num_tokens,
-                    req_id_prefix="_sparse_mla_v2_warmup",
-                )
-            else:
-                runner._dummy_run(**dummy_run_kwargs)
+    finally:
+        if _pg_set:
+            fi_utils.set_autotune_process_group(None)
 
     if not warmup_executed:
         return False

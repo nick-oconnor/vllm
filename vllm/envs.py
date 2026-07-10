@@ -191,6 +191,7 @@ if TYPE_CHECKING:
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
+    VLLM_FLASHINFER_AUTOTUNE_PROCESS_GROUP: bool = False
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_XGRAMMAR_CACHE_MB: int = 0
@@ -1569,6 +1570,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Override the directory for the FlashInfer autotune config cache.
     "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": lambda: os.getenv(
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR", None
+    ),
+    # Sync FlashInfer autotune tactic choice across ranks (FlashInfer PR
+    # #3187). Prevents per-rank tactic divergence which can produce Xid-69
+    # class illegal-kernel-op failures on the next collective when TP/EP is
+    # active. Try-import guarded in the warmup autotune block; requires a
+    # FlashInfer version that exposes set_autotune_process_group().
+    "VLLM_FLASHINFER_AUTOTUNE_PROCESS_GROUP": lambda: bool(
+        int(os.getenv("VLLM_FLASHINFER_AUTOTUNE_PROCESS_GROUP", "0"))
     ),
     # Flashinfer fused allreduce backend.
     "VLLM_FLASHINFER_ALLREDUCE_BACKEND": env_with_choices(
