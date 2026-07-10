@@ -194,6 +194,7 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_AUTOTUNE_PROCESS_GROUP: bool = False
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
+    VLLM_KV_OFFLOAD_COLLECTIVE_BARRIER: bool = False
     VLLM_XGRAMMAR_CACHE_MB: int = 0
     VLLM_REGEX_COMPILATION_TIMEOUT_S: int = 5
     VLLM_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
@@ -1578,6 +1579,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # FlashInfer version that exposes set_autotune_process_group().
     "VLLM_FLASHINFER_AUTOTUNE_PROCESS_GROUP": lambda: bool(
         int(os.getenv("VLLM_FLASHINFER_AUTOTUNE_PROCESS_GROUP", "0"))
+    ),
+    # Insert a host-side collective barrier after OffloadingConnector
+    # start_load_kv returns, to prevent the TP/EP rank desync that deadlocks
+    # in the forward's NCCL collectives. Off by default; KV offloading is
+    # unused in production (1M context fits in GPU KV). See
+    # notes/incident-kv-offload-deadlock.md.
+    "VLLM_KV_OFFLOAD_COLLECTIVE_BARRIER": lambda: bool(
+        int(os.getenv("VLLM_KV_OFFLOAD_COLLECTIVE_BARRIER", "0"))
     ),
     # Flashinfer fused allreduce backend.
     "VLLM_FLASHINFER_ALLREDUCE_BACKEND": env_with_choices(
