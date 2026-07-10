@@ -192,14 +192,18 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
         use_persistent_cache = False
 
     if not use_persistent_cache:
-        with torch.inference_mode(), fi_utils.autotune():
-            runner._dummy_run(
-                num_tokens=runner.scheduler_config.max_num_batched_tokens,
-                skip_eplb=True,
-                is_profile=True,
-            )
-        get_world_group().barrier()
-        return
+        try:
+            with torch.inference_mode(), fi_utils.autotune():
+                runner._dummy_run(
+                    num_tokens=runner.scheduler_config.max_num_batched_tokens,
+                    skip_eplb=True,
+                    is_profile=True,
+                )
+            get_world_group().barrier()
+            return
+        finally:
+            if _pg_set:
+                fi_utils.set_autotune_process_group(None)
 
     world = get_world_group()
     is_leader = world.rank_in_group == 0
