@@ -823,8 +823,17 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 # Install FlashInfer from source: the prebuilt jit-cache wheel lacks the SM120
 # (Blackwell) FP4/CUTLASS MoE kernels, so build from a commit with SM120 support.
 # https://docs.flashinfer.ai/installation.html
+#
+# Pin moved past `b5ac097e` to include FlashInfer PR #3187 (commit
+# `2c0d595f`), which adds `set_autotune_process_group()` for cross-rank
+# autotune tactic sync — fixes the per-rank-tactic-divergence class of bugs
+# (Xid-69 on long-context requests, see
+# sm120-enablement/notes/incident-longcontext-xid69.md). Requires the
+# matching vLLM wire-up (VLLM_FLASHINFER_AUTOTUNE_PROCESS_GROUP=1) to take
+# effect; the env var is gated by has_flashinfer_autotune_process_group()
+# and is a no-op on older FlashInfer versions.
 RUN --mount=type=cache,target=/opt/uv/cache \
-    uv pip install --system "flashinfer-python @ git+https://github.com/flashinfer-ai/flashinfer.git@b5ac097e7c96faf756ceed9a94f6cc1697b920fc" \
+    uv pip install --system "flashinfer-python @ git+https://github.com/flashinfer-ai/flashinfer.git@2c0d595fc5083ef00ecc022db07506cd500226bb" \
         -v
 
 # ============================================================
