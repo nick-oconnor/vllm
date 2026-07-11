@@ -7,9 +7,6 @@ build:
   variables:
     DOCKER_HOST: tcp://docker:2375
     DOCKER_TLS_CERTDIR: ""
-  services:
-  - name: docker:dind
-    command: ["--mtu=1420"]
   timeout: 6 hours
   before_script:
   - |
