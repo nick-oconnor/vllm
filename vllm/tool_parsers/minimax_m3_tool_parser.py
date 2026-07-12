@@ -9,6 +9,9 @@ from typing import Any
 from vllm.entrypoints.chat_utils import make_tool_call_id
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.openai.engine.protocol import (
+    DeltaFunctionCall,
+    DeltaMessage,
+    DeltaToolCall,
     ExtractedToolCallInformation,
     FunctionCall,
     ToolCall,
@@ -24,11 +27,6 @@ _TOOL_CALL_OPEN = _NS + "<tool_call>"
 _TOOL_CALL_CLOSE = _NS + "</tool_call>"
 _NS_ESC = re.escape(_NS)
 
-# Streaming: normalise any tag that is missing the NS prefix.
-_MISSING_NS_RE = re.compile(
-    r"(?<!" + _NS_ESC + r")(</?[A-Za-z_][A-Za-z0-9_.:-]*(?:\s[^>]*)?>)"
-)
-
 _NS_INVOKE_OPEN_RE = re.compile(_NS_ESC + r'<invoke name="([^"]+)">')
 _NS_INVOKE_CLOSE = _NS + "</invoke>"
 _NS_OPEN_TAG_RE = re.compile(_NS_ESC + r"<([A-Za-z_][A-Za-z0-9_-]*)>")
@@ -36,6 +34,21 @@ _NS_CLOSE_TAG_RE = re.compile(_NS_ESC + r"</([A-Za-z_][A-Za-z0-9_-]*)>")
 
 _ITEM_OPEN_RE = re.compile(r"<item\b[^>]*>")
 _ITEM_CLOSE = "</item>"
+
+
+def _content_safe_end(text: str) -> int:
+    """Largest index up to which *text* can be emitted as content without
+    splitting a tool-call-open marker.
+
+    Holds back a trailing suffix of *text* that is a proper prefix of
+    ``_TOOL_CALL_OPEN`` (the marker may complete in a later delta), so a
+    partial ``]<]minimax[>[<tool_call>`` never leaks into the stream.
+    """
+    open_tok = _TOOL_CALL_OPEN
+    for k in range(min(len(text), len(open_tok) - 1), 0, -1):
+        if open_tok.startswith(text[-k:]):
+            return len(text) - k
+    return len(text)
 
 
 def _extract_top_level_items(s: str) -> list[str] | None:
@@ -283,8 +296,16 @@ class MinimaxM3ToolParser(RustToolParser):
         )
 
     # ------------------------------------------------------------------
-    # Streaming: Rust incremental parser with NS normalisation
+    # Streaming: buffer the tool-call block, parse with the tolerant parser
     # ------------------------------------------------------------------
+    # The Rust incremental parser hard-fails on a partial/in-flight invoke (it
+    # requires the whole tool call buffered and is strict about the namespace),
+    # so streaming clients (e.g. opencode) never get the tool call even though
+    # the non-streaming path parses it fine. The tolerant _python_extract_tool_calls
+    # is not incremental, so here we stream leading content normally, buffer the
+    # tool-call block, and parse it once the closing ]<]minimax[>[</tool_call>
+    # arrives — emitting the call(s) as a single delta. Argument-level streaming
+    # is sacrificed (fine for tool calls: a client can't act on a partial one).
 
     def extract_tool_calls_streaming(
         self,
@@ -295,33 +316,53 @@ class MinimaxM3ToolParser(RustToolParser):
         current_token_ids: Sequence[int],
         delta_token_ids: Sequence[int],
         request: ChatCompletionRequest,
-    ):
-        if _TOOL_CALL_OPEN in current_text:
-            delta_text = _MISSING_NS_RE.sub(_NS + r"\1", delta_text)
-            # The per-delta lookbehind cannot see a namespace marker that
-            # arrived in an earlier delta (the marker is its own token), so it
-            # re-adds one and produces a doubled ]<]minimax[>[]<]minimax[>[
-            # prefix the Rust parser rejects. Drop the duplicate straddling the
-            # delta boundary.
-            if previous_text.endswith(_NS) and delta_text.startswith(_NS):
-                delta_text = delta_text[len(_NS) :]
+    ) -> DeltaMessage | None:
+        if not previous_text:
+            self._m3_tool_emitted = False
+            self._m3_content_len = 0  # chars of content already streamed
 
-        delta = super().extract_tool_calls_streaming(
-            previous_text,
-            current_text,
-            delta_text,
-            previous_token_ids,
-            current_token_ids,
-            delta_token_ids,
-            request,
-        )
+        start_idx = current_text.find(_TOOL_CALL_OPEN)
 
-        # The ]<]minimax[>[ namespace marker prefixes every tool-call tag and is
-        # never valid assistant content. The incremental parser can surface it
-        # as a content delta before the following <tool_call> token promotes it
-        # to a tool call; strip it so it never leaks into the streamed output.
-        if delta is not None and delta.content and _NS in delta.content:
-            cleaned = delta.content.replace(_NS, "")
-            delta.content = cleaned or None
+        # No complete tool-call-open yet: stream content up to a possible
+        # trailing partial marker (held back so it never leaks), stripping any
+        # stray complete namespace marker (never valid content).
+        if start_idx == -1:
+            boundary = _content_safe_end(current_text)
+            new = current_text[self._m3_content_len : boundary]
+            self._m3_content_len = boundary
+            new = new.replace(_NS, "") if _NS in new else new
+            return DeltaMessage(content=new) if new else None
 
-        return delta
+        # A tool-call block has started. Flush any not-yet-emitted leading
+        # content before the block, then buffer the block.
+        if self._m3_content_len < start_idx:
+            new = current_text[self._m3_content_len : start_idx]
+            self._m3_content_len = start_idx
+            new = new.replace(_NS, "") if _NS in new else new
+            if new:
+                return DeltaMessage(content=new)
+
+        # Inside the tool-call block: buffer until the close arrives, then emit
+        # the parsed call(s) exactly once.
+        if getattr(self, "_m3_tool_emitted", False):
+            return None
+        if _TOOL_CALL_CLOSE not in current_text[start_idx:]:
+            return None
+
+        info = _python_extract_tool_calls(current_text, self._tools_by_name())
+        if info is None or not info.tool_calls:
+            return None
+        self._m3_tool_emitted = True
+        tool_calls = [
+            DeltaToolCall(
+                index=index,
+                id=call.id,
+                type="function",
+                function=DeltaFunctionCall(
+                    name=call.function.name,
+                    arguments=call.function.arguments,
+                ),
+            )
+            for index, call in enumerate(info.tool_calls)
+        ]
+        return DeltaMessage(tool_calls=tool_calls)
