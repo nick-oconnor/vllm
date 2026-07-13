@@ -94,9 +94,40 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
         # - skip input activation quantization (kernel applies scaling)
         self.use_deepseek_fp8_block_scale = quant_config.is_block_quantized
         self.gemm1_clamp_limit: torch.Tensor | None = None
-        if quant_config.gemm1_clamp_limit is not None:
+        _clamp = quant_config.gemm1_clamp_limit
+        if _clamp is None:
+            # ocnr: MiniMax-M3 surfaces the clamp limit via moe_config.swiglu_limit
+            # rather than quant_config.gemm1_clamp_limit; fall back to it.
+            _clamp = getattr(moe_config, "swiglu_limit", None)
+        if _clamp is not None:
             self.gemm1_clamp_limit = torch.tensor(
-                [quant_config.gemm1_clamp_limit] * self.num_experts,
+                [float(_clamp)] * self.num_experts,
+                dtype=torch.float32,
+                device=self.device,
+            )
+
+        # ocnr: per-expert SwiGLU alpha/beta for clamped swigluoai_uninterleave
+        # (MiniMax-M3 NVFP4). Upstream only sets these on the mxfp4 (gpt-oss)
+        # branch below; the NVFP4 path left them None, dropping the clamp bias.
+        # Populate from the quant config with a moe_config fallback. The mxfp4
+        # branch still overwrites with its hard-coded gpt-oss defaults.
+        self.gemm1_alpha: torch.Tensor | None = None
+        self.gemm1_beta: torch.Tensor | None = None
+        _alpha = getattr(quant_config, "gemm1_alpha", None)
+        if _alpha is None:
+            _alpha = getattr(moe_config, "swiglu_alpha", None)
+        _beta = getattr(quant_config, "gemm1_beta", None)
+        if _beta is None:
+            _beta = getattr(moe_config, "swiglu_beta", None)
+        if _alpha is not None:
+            self.gemm1_alpha = torch.tensor(
+                [float(_alpha)] * self.num_experts,
+                dtype=torch.float32,
+                device=self.device,
+            )
+        if _beta is not None:
+            self.gemm1_beta = torch.tensor(
+                [float(_beta)] * self.num_experts,
                 dtype=torch.float32,
                 device=self.device,
             )
@@ -190,6 +221,8 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             MoEActivation.GELU_TANH,
             MoEActivation.RELU2_NO_MUL,
             MoEActivation.SWIGLUOAI,
+            # ocnr: MiniMax-M3 packed clamped SwiGLU-OAI.
+            MoEActivation.SWIGLUOAI_UNINTERLEAVE,
         ]
 
     @staticmethod
@@ -269,6 +302,11 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             MoEActivation.SILU: ActivationType.Swiglu,  # This is the default
             MoEActivation.GELU_TANH: ActivationType.Geglu,
             MoEActivation.SWIGLUOAI: ActivationType.Swiglu,  # gpt-oss alias
+            # ocnr: MiniMax-M3 packed clamped SwiGLU-OAI. MUST be SwigluBias, not
+            # Swiglu — only the SwigluBias adaptor forwards the swiglu
+            # alpha/beta/limit clamp; plain Swiglu drops it and activations
+            # explode across the MoE stack -> garbage output.
+            MoEActivation.SWIGLUOAI_UNINTERLEAVE: ActivationType.SwigluBias,
             MoEActivation.RELU2_NO_MUL: ActivationType.Relu2,
         }
         assert activation in activation_str_to_value_map, (
@@ -280,11 +318,20 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
         fc2_expert_weights = None
         fc1_expert_biases = None
         fc2_expert_biases = None
-        swiglu_alpha = None
-        swiglu_beta = None
-        swiglu_limit = (
-            self.gemm1_clamp_limit if activation == MoEActivation.SILU else None
-        )
+        # ocnr: forward the clamp bias (alpha/beta/limit) on the NVFP4 path for
+        # MiniMax-M3 clamped SwiGLU-OAI. Upstream only sets swiglu_limit for SILU
+        # here and alpha/beta on the mxfp4 branch below, leaving the NVFP4 M3
+        # path unclamped (SwigluBias with all-None params == no clamp).
+        if activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE:
+            swiglu_alpha = self.gemm1_alpha
+            swiglu_beta = self.gemm1_beta
+            swiglu_limit = self.gemm1_clamp_limit
+        else:
+            swiglu_alpha = None
+            swiglu_beta = None
+            swiglu_limit = (
+                self.gemm1_clamp_limit if activation == MoEActivation.SILU else None
+            )
         use_mxfp8_act_scaling = False
         use_w4_group_scaling = False
         # Select quantization metadata based on FP8 format/path

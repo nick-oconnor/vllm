@@ -2499,6 +2499,12 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
                 "language_model.model." + prefix[len("model.language_model.") :]
             )
 
+        # A nested causal-LM weight mapper (VL wrapper case) may strip a leading
+        # "language_model." from the config keys while the live module prefix
+        # keeps it, so also try the stripped form. Mirrors is_layer_excluded.
+        if prefix.startswith("language_model."):
+            candidates.append(prefix.removeprefix("language_model."))
+
         return tuple(dict.fromkeys(candidates))
 
     def get_quant_method(
