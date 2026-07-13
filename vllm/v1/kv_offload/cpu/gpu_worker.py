@@ -403,6 +403,22 @@ class SingleDirectionOffloadingHandler:
                 )
             end_event.record(stream)
 
+        # Stream-side ordering for CPU->GPU loads (gated on
+        # VLLM_KV_OFFLOAD_COLLECTIVE_BARRIER): make the load completion
+        # visible to the compute stream so subsequent ops on that stream
+        # (attention reads, NCCL collectives) are automatically ordered
+        # after the load by CUDA stream graph. Without this, attention may
+        # read stale KV data on this rank before the load completes.
+        # Combined with the TP barrier in OffloadingConnector.start_load_kv
+        # (which gates cross-rank entry into the forward), this eliminates
+        # the rank-desync deadlock documented in
+        # sm120-enablement/notes/incident-kv-offload-deadlock.md.
+        if not self.gpu_to_cpu:
+            from vllm import envs
+
+            if envs.VLLM_KV_OFFLOAD_COLLECTIVE_BARRIER:
+                current_platform.current_stream().wait_event(end_event)
+
         self._transfer_events[job_id] = end_event
         self._transfers.append(
             Transfer(

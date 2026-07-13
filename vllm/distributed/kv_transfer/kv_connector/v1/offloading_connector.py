@@ -91,6 +91,33 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         assert isinstance(self._connector_metadata, OffloadingConnectorMetadata)
         self.connector_worker.start_kv_transfers(self._connector_metadata)
 
+        # Optional collective barrier: prevents the TP/EP rank desync that
+        # deadlocks the forward's NCCL collectives when async CPU->GPU loads
+        # complete at slightly different times across ranks.
+        #
+        # Without this, fast ranks enter the TP all-gather while slow ranks
+        # are still loading from host RAM -> classic one-rank-out NCCL
+        # deadlock (3 GPUs at 100% in NCCL, 1 at 0% diverged).
+        #
+        # See sm120-enablement/notes/incident-kv-offload-deadlock.md.
+        # Off by default; KV offloading is unused in production (1M context
+        # fits in GPU KV at 0.97 util, so the option is unreachable without
+        # also re-enabling --kv-offloading-size).
+        from vllm import envs
+
+        if envs.VLLM_KV_OFFLOAD_COLLECTIVE_BARRIER:
+            # 1. Wait for this rank's loads to complete on the GPU.
+            self.connector_worker.wait_for_pending_loads()
+            # 2. Barrier across the TP group so every rank has reached the
+            #    same point before any rank enters the forward's collectives.
+            #    Uses the TP group (not world) to match the collectives the
+            #    forward will issue. No-op when TP size == 1.
+            from vllm.distributed.parallel_state import get_tp_group
+
+            tp_group = get_tp_group()
+            if tp_group.world_size > 1:
+                tp_group.barrier()
+
     def wait_for_layer_load(self, layer_name: str) -> None:
         pass
 

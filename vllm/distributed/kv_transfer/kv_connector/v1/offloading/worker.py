@@ -291,6 +291,26 @@ class OffloadingConnectorWorker:
             success = self.worker.submit_load(job_id, entry.src_spec, entry.dst_spec)
             assert success
 
+    def wait_for_pending_loads(self) -> None:
+        """
+        Block this rank's host thread until every in-flight CPU->GPU load
+        submitted by ``start_kv_transfers`` since the last ``get_finished``
+        call has completed on the GPU.
+
+        Used by the optional ``VLLM_KV_OFFLOAD_COLLECTIVE_BARRIER`` path: a
+        host-side load-complete sync followed by a TP-group barrier after
+        ``start_load_kv`` is what prevents the rank-desync deadlock documented
+        in ``sm120-enablement/notes/incident-kv-offload-deadlock.md``.
+
+        Safe to call when ``_load_jobs`` is empty (no-op). Stores are not
+        waited on — only loads, because only loads gate forward correctness
+        (KV cache must be present before attention reads it).
+        """
+        if not self._load_jobs:
+            return
+        assert self.worker is not None
+        self.worker.wait(set(self._load_jobs.keys()))
+
     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
         for job_id, entry in metadata.store_jobs.items():
             # NOTE(orozery): defer the store to the beginning of the next
