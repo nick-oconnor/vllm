@@ -254,8 +254,37 @@ def test_streaming_nested_tool_call(parser):
     assert len(tool_calls) == 1
     assert tool_calls[0]["name"] == "create_order"
     assert tool_calls[0]["id"] is not None
-    assert json.loads(tool_calls[0]["arguments"]) == json.loads(
-        parser.streamed_args_for_tool[0]
+    # ocnr: streaming now buffers the block and emits the tolerant-parsed call
+    # once complete, so the full (nested) arguments arrive in one delta.
+    assert json.loads(tool_calls[0]["arguments"])["items"][1]["qty"] == 5
+
+
+def test_streaming_tool_call_split_mid_invoke(parser):
+    # Reproduces the production failure: the Rust incremental parser hard-fails
+    # on a partial invoke streamed across chunk boundaries (splitting inside the
+    # invoke tag and inside a parameter value), so opencode never got the call.
+    # The buffer-and-tolerant-parse path must emit it once the block completes.
+    text = (
+        f"{NS}<tool_call>\n"
+        f'{NS}<invoke name="create_order">'
+        f"{NS}<user_id>7{NS}</user_id>"
+        f"{NS}</invoke>\n"
+        f"{NS}</tool_call>"
     )
-    assert json.loads(parser.prev_tool_call_arr[0]["arguments"])["items"][1]["qty"] == 5
+    results = _feed(
+        parser,
+        [
+            text[:20],  # split inside the tool_call open / invoke tag
+            text[20:40],  # split inside a parameter
+            text[40:],
+            ("", [EOS_ID]),
+        ],
+    )
+
+    assert _collect_content(results) == ""
+    tool_calls = _collect_tool_calls(results)
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["name"] == "create_order"
+    assert tool_calls[0]["id"] is not None
+    assert json.loads(tool_calls[0]["arguments"]) == {"user_id": 7}
     assert results[-1].content is None

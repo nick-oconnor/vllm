@@ -1,5 +1,5 @@
 use winnow::ascii::{multispace0 as ws0, multispace1 as ws1};
-use winnow::combinator::{alt, delimited, seq};
+use winnow::combinator::{alt, delimited, opt, seq};
 use winnow::error::{ContextError, ErrMode};
 use winnow::prelude::*;
 use winnow::stream::Partial;
@@ -12,6 +12,9 @@ use crate::tool::Tool;
 
 const NAMESPACE: &str = "]<]minimax[>[";
 const TOOL_CALL_START: &str = "]<]minimax[>[<tool_call>";
+// ocnr: only the tests build a well-formed namespaced close now; the parser
+// matches the close via NAMESPACE + "</tool_call>" (prefix optional) below.
+#[cfg(test)]
 const TOOL_CALL_END: &str = "]<]minimax[>[</tool_call>";
 const INVOKE_START: &str = "]<]minimax[>[<invoke";
 const INVOKE_END: &str = "]<]minimax[>[</invoke>";
@@ -219,8 +222,14 @@ fn parse_tool_block_event(
 }
 
 /// Parse a MiniMax M3 tool-block end marker.
+///
+/// ocnr: the model intermittently drops the `]<]minimax[>[` namespace prefix on
+/// the closing tag (in streaming the bare `</tool_call>` arrives split across
+/// token deltas, so a per-delta normalisation cannot repair it). Accept the
+/// close with or without the prefix so a bare `</tool_call>` still ends the
+/// block instead of failing the whole tool call.
 fn tool_block_end_event(input: &mut MinimaxM3Input<'_>) -> ModalResult<MinimaxM3Event> {
-    (ws0, literal(TOOL_CALL_END))
+    (ws0, opt(literal(NAMESPACE)), literal("</tool_call>"))
         .value(MinimaxM3Event::ToolBlockEnd)
         .parse_next(input)
 }
