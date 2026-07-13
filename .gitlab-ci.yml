@@ -17,17 +17,23 @@ build:
     docker login -u build-token -p "${BUILD_TOKEN}" "${CI_REGISTRY}"
     docker buildx create --use --driver docker-container --driver-opt image=moby/buildkit:latest
     export CONTAINER_TAG=$(cat VERSION | sed 's/^v//; s/^.*://; s/+/-/; s/\.cu/-cu/')
-    export CACHE_REF="registry.ocnr.org/infra/container-cache:vllm"
+    export CACHE_REF="registry.ocnr.org/infra/container-cache:vllm-${CI_COMMIT_BRANCH}"
+    export TAG_ARGS="-t ${CI_REGISTRY_IMAGE}:${CONTAINER_TAG}"
+    if [ "${CI_COMMIT_BRANCH}" = "${CI_DEFAULT_BRANCH}" ]; then
+      export TAG_ARGS="${TAG_ARGS} -t ${CI_REGISTRY_IMAGE}:latest"
+    else
+      export TAG_ARGS="${TAG_ARGS} -t ${CI_REGISTRY_IMAGE}:${CI_COMMIT_BRANCH}"
+    fi
   script:
   - |
     docker buildx build \
       --cache-from "type=registry,ref=${CACHE_REF}" \
       --cache-to "type=registry,ref=${CACHE_REF},mode=max" \
-      -t "${CI_REGISTRY_IMAGE}:${CONTAINER_TAG}" \
-      -t "${CI_REGISTRY_IMAGE}:latest" \
+      ${TAG_ARGS} \
       -f docker/Dockerfile \
       --push .
   rules:
   - if: $CI_PIPELINE_SOURCE == 'schedule'
     when: never
   - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  - if: $CI_COMMIT_BRANCH == 'next'
