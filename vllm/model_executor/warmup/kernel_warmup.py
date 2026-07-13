@@ -143,6 +143,7 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     Tuning is performed only on rank 0. The resulting cache is broadcast
     to every rank so all ranks dispatch the same kernel tactic.
     """
+    import vllm.envs
     import vllm.utils.flashinfer as fi_utils
     from vllm.distributed.parallel_state import get_world_group
 
@@ -151,6 +152,34 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     # When distributed, tune on every rank so the collectives stay synchronized.
     if get_world_group().world_size > 1:
         use_persistent_cache = False
+
+    # Optional cross-rank tactic sync (FlashInfer PR #3187 / commit
+    # 2c0d595f). All-reduces measured kernel timings across the TP group
+    # before argmin so every rank picks the same tactic. Without this, per-rank
+    # argmin over locally-measured timings can pick different configs under
+    # JIT/J-cache variance, producing mismatched state in the next collective
+    # and surfacing as Xid-69 (Graphics Engine class error, illegal kernel
+    # operation). The all-ranks autotune above already guarantees the sync
+    # itself runs on every rank; this just makes the per-tactic choice
+    # collective. Try-import guarded -- no-op on FlashInfer versions that
+    # lack the API.
+    _pg_set = False
+    if (
+        envs.VLLM_FLASHINFER_AUTOTUNE_PROCESS_GROUP
+        and fi_utils.has_flashinfer_autotune_process_group()
+    ):
+        try:
+            from vllm.distributed.parallel_state import get_tp_group
+
+            fi_utils.set_autotune_process_group(get_tp_group().cpu_group)
+            _pg_set = True
+        except Exception as e:  # noqa: BLE001 -- best-effort opt-in
+            logger.warning(
+                "FlashInfer autotune process-group sync could not be "
+                "enabled (%s: %s); falling back to leader-only autotune.",
+                type(e).__name__,
+                e,
+            )
 
     if not use_persistent_cache:
         with torch.inference_mode(), fi_utils.autotune():
@@ -211,3 +240,8 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
             world.rank_in_group,
             cache_path,
         )
+
+    # Reset the autotune process-group hook so it doesn't leak into later
+    # unrelated autotune runs (e.g. dynamic autotune on subsequent requests).
+    if _pg_set:
+        fi_utils.set_autotune_process_group(None)

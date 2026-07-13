@@ -169,6 +169,43 @@ autotune = _lazy_import_wrapper(
 
 
 @functools.cache
+def has_flashinfer_autotune_process_group() -> bool:
+    """Return ``True`` if FlashInfer exposes ``set_autotune_process_group``.
+
+    Added in FlashInfer PR #3187 (commit ``2c0d595f``, 2026-07-10). When
+    available, callers can wire it around the warmup autotune block so that
+    per-rank tactic choice is synchronised across the TP/EP group -- fixes
+    the same family of rank-desync bugs as the KV-offload barrier (see
+    ``sm120-enablement/notes/incident-longcontext-xid69.md``).
+    """
+    if not has_flashinfer():
+        return False
+    mod = _get_submodule("flashinfer.autotuner")
+    return mod is not None and hasattr(mod, "set_autotune_process_group")
+
+
+def set_autotune_process_group(group: Any) -> None:
+    """Set the process group that FlashInfer's autotuner will all-reduce
+    measured kernel timings across. No-op on FlashInfer versions that lack
+    the API (PR #3187 / ``2c0d595f``).
+    """
+    if not has_flashinfer_autotune_process_group():
+        return
+    from flashinfer.autotuner import set_autotune_process_group
+
+    set_autotune_process_group(group)
+
+
+def get_autotune_process_group() -> Any:
+    """Return the currently-set autotune process group, or ``None``."""
+    if not has_flashinfer_autotune_process_group():
+        return None
+    from flashinfer.autotuner import get_autotune_process_group
+
+    return get_autotune_process_group()
+
+
+@functools.cache
 def has_flashinfer_comm() -> bool:
     """Return `True` if FlashInfer comm module is available."""
     return has_flashinfer() and importlib.util.find_spec("flashinfer.comm") is not None
@@ -1033,6 +1070,9 @@ __all__ = [
     "flashinfer_trtllm_batch_decode_with_kv_cache_mla",
     "flashinfer_trtllm_batch_decode_sparse_mla_dsv4",
     "autotune",
+    "set_autotune_process_group",
+    "get_autotune_process_group",
+    "has_flashinfer_autotune_process_group",
     "has_flashinfer_moe",
     "has_flashinfer_comm",
     "has_flashinfer_nvlink_two_sided",
