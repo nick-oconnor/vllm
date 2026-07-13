@@ -828,6 +828,19 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     uv pip install --system "flashinfer-python @ git+https://github.com/flashinfer-ai/flashinfer.git@2c0d595fc5083ef00ecc022db07506cd500226bb" \
         -v
 
+# Install py-spy + the jam-state dump script. Pre-installed so we don't have
+# to `pip install py-spy` into a jammed pod at incident time. See
+# tools/dump_jam_state.sh; the script writes to /home/vllm/jam-<ts>-<host>/
+# and captures py-spy dumps for every vllm/EngineCore/Worker PID plus
+# nvidia-smi + dmesg Xid lines. Critical for the post-mortem workflow in
+# sm120-enablement/notes/incident-longcontext-xid69.md and
+# sm120-enablement/notes/incident-kv-offload-deadlock.md.
+RUN --mount=type=cache,target=/opt/uv/cache \
+    uv pip install --system py-spy \
+        && py-spy --version
+COPY tools/dump_jam_state.sh /usr/local/bin/dump-jam-state.sh
+RUN chmod 0755 /usr/local/bin/dump-jam-state.sh
+
 # ============================================================
 # OPENAI API SERVER DEPENDENCIES
 # Pre-install these to avoid reinstalling on every vLLM wheel rebuild
