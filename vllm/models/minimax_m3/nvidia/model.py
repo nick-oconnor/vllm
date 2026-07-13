@@ -795,8 +795,8 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
             padded_num_tokens = (max_num_batched_tokens + 3) // 4 * 4
             self.topk_indices_buffer = torch.empty(
-                padded_num_tokens,
                 num_index_heads,
+                padded_num_tokens,
                 sparse_cfg["sparse_topk_blocks"],
                 dtype=torch.int32,
             )
