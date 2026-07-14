@@ -18,12 +18,7 @@ build:
     docker buildx create --use --driver docker-container --driver-opt image=moby/buildkit:latest
     export CONTAINER_TAG=$(cat VERSION | sed 's/^v//; s/^.*://; s/+/-/; s/\.cu/-cu/')
     export CACHE_REF="registry.ocnr.org/infra/container-cache:vllm-${CI_COMMIT_BRANCH}"
-    export TAG_ARGS="-t ${CI_REGISTRY_IMAGE}:${CONTAINER_TAG}"
-    if [ "${CI_COMMIT_BRANCH}" = '0.25' ]; then
-      export TAG_ARGS="${TAG_ARGS} -t ${CI_REGISTRY_IMAGE}:latest"
-    else
-      export TAG_ARGS="${TAG_ARGS} -t ${CI_REGISTRY_IMAGE}:${CI_COMMIT_BRANCH}"
-    fi
+    export TAG_ARGS="-t ${CI_REGISTRY_IMAGE}:${CONTAINER_TAG} -t ${CI_REGISTRY_IMAGE}:${CI_COMMIT_BRANCH}"
   script:
   - |
     docker buildx build \
