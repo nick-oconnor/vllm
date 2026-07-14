@@ -36,4 +36,4 @@ build:
   - if: $CI_PIPELINE_SOURCE == 'schedule'
     when: never
   - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-  - if: $CI_COMMIT_BRANCH == 'next'
+  - if: $CI_COMMIT_BRANCH == '0.25'
