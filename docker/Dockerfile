@@ -22,9 +22,9 @@
 #   docker buildx bake -f docker/docker-bake.hcl -f docker/versions.json
 # =============================================================================
 
-ARG CUDA_VERSION=13.1.1
+ARG CUDA_VERSION=13.3.0
 ARG PYTHON_VERSION=3.12
-ARG UBUNTU_VERSION=24.04
+ARG UBUNTU_VERSION=26.04
 
 # By parameterizing the base images, we allow third-party to use their own
 # base images. One use case is hermetic builds with base images stored in
@@ -37,7 +37,7 @@ ARG UBUNTU_VERSION=24.04
 # compatibility with other Linux OSes. The main reason for this is that the
 # glibc version is baked into the distro, and binaries built with one glibc
 # version are not backwards compatible with OSes that use an earlier version.
-ARG BUILD_BASE_IMAGE=docker.io/nvidia/cuda:${CUDA_VERSION}-devel-ubuntu24.04
+ARG BUILD_BASE_IMAGE=docker.io/nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION}
 # Using cuda base image with minimal dependencies necessary for JIT compilation (FlashInfer, DeepGEMM, EP kernels)
 ARG FINAL_BASE_IMAGE=docker.io/nvidia/cuda:${CUDA_VERSION}-base-ubuntu${UBUNTU_VERSION}
 
@@ -509,8 +509,8 @@ ARG PIP_INDEX_URL UV_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL
 ARG PYTORCH_CUDA_INDEX_BASE_URL
 
-# ocnr: override the build version so the wheel reports `0.25.1+sm120.cu131`
-ARG VLLM_VERSION_OVERRIDE=0.25.1+sm120.cu131
+# ocnr: override the build version so the wheel reports `0.25.1+sm120.cu133`
+ARG VLLM_VERSION_OVERRIDE=0.25.1+sm120.cu133
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=${VLLM_VERSION_OVERRIDE}
 
 # We can specify the standard or nightly build of PyTorch
