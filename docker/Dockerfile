@@ -498,8 +498,8 @@ ARG PIP_INDEX_URL UV_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL
 ARG PYTORCH_CUDA_INDEX_BASE_URL
 
-# ocnr: override the build version so the wheel reports `0.25.1+sm120.cu133`
-ARG VLLM_VERSION_OVERRIDE=0.25.1+sm120.cu133
+# ocnr: override the build version so the wheel reports `0.26.0+sm120.cu133`
+ARG VLLM_VERSION_OVERRIDE=0.26.0+sm120.cu133
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=${VLLM_VERSION_OVERRIDE}
 
 # We can specify the standard or nightly build of PyTorch
