@@ -29,8 +29,11 @@ if(DEEPGEMM_SRC_DIR)
 else()
   # Keep in sync with tools/install_deepgemm.sh
   set(_DEEPGEMM_UPSTREAM_REPO "https://github.com/vllm-project/DeepGEMM.git")
-  # TODO: switch to nv_dev branch after it support situ
-  set(_DEEPGEMM_UPSTREAM_TAG "e21c821f39a2056d68067a466c64ddc942200106")
+  # NOTE: This revision carries the SM120 (consumer Blackwell) kernels. The
+  # stock upstream tag lacks SM120 support: on SM120, fp8 weight
+  # post-processing asserts "Unknown SF transformation" at engine init and
+  # there are no SM120 kernels to dispatch to.
+  set(_DEEPGEMM_UPSTREAM_TAG "9e8903799beb0b65d88e5ca08940dd5cd712c7d2")
 
   set(_deepgemm_fc_root "${FETCHCONTENT_BASE_DIR}")
   if(NOT _deepgemm_fc_root)
