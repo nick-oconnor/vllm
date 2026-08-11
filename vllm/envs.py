@@ -204,6 +204,7 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_AUTOTUNE_PROCESS_GROUP: bool = False
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
+    VLLM_KV_OFFLOAD_COLLECTIVE_BARRIER: bool = False
     VLLM_XGRAMMAR_CACHE_MB: int = 0
     VLLM_REGEX_COMPILATION_TIMEOUT_S: int = 5
     VLLM_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
@@ -1665,6 +1666,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # set_autotune_process_group().
     "VLLM_FLASHINFER_AUTOTUNE_PROCESS_GROUP": lambda: bool(
         int(os.getenv("VLLM_FLASHINFER_AUTOTUNE_PROCESS_GROUP", "0"))
+    ),
+    # After OffloadingConnector start_load_kv returns, wait for this rank's
+    # loads to finish on the GPU then barrier the TP group, so every rank
+    # enters the forward's collectives together. Prevents the TP/EP rank
+    # desync that deadlocks when offloaded KV loads land asynchronously at
+    # different times across ranks. Off by default.
+    "VLLM_KV_OFFLOAD_COLLECTIVE_BARRIER": lambda: bool(
+        int(os.getenv("VLLM_KV_OFFLOAD_COLLECTIVE_BARRIER", "0"))
     ),
     # Flashinfer fused allreduce backend.
     "VLLM_FLASHINFER_ALLREDUCE_BACKEND": env_with_choices(
