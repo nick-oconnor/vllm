@@ -82,6 +82,13 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
         "FlashInferMLASparseSM90Backend"
     )
     TRITON_MLA = "vllm.v1.attention.backends.mla.triton_mla.TritonMLABackend"
+    # SM120/121 rope-free (NoPE, qk_rope_head_dim == 0) sparse-MLA lane driven
+    # by the indexed d512 Triton kernels (GLM-5.3-Flash). See
+    # vllm/v1/attention/backends/mla/d512_mla_sparse_sm120.py.
+    D512_SM120 = (
+        "vllm.v1.attention.backends.mla.d512_mla_sparse_sm120."
+        "D512MLASparseBackend"
+    )
     CUTLASS_MLA = "vllm.v1.attention.backends.mla.cutlass_mla.CutlassMLABackend"
     FLASHMLA = "vllm.v1.attention.backends.mla.flashmla.FlashMLABackend"
     FLASHMLA_SPARSE = (

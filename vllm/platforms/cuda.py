@@ -128,6 +128,30 @@ def _get_backend_priorities(
                 *sparse_backends,
             ]
         elif device_capability.major == 12:
+            # GLM-5.3-Flash-style rope-free sparse MLA (qk_rope_head_dim == 0)
+            # has no family-120 kernel on the FlashInfer fp8_ds_mla lane; the
+            # staged effective topk width (index_topk=2048, kpool=4 -> padded
+            # 2176) also exceeds the 2048 the lane is instantiated for. Prefer
+            # the indexed d512 Triton lane for NoPE models; DeepSeek-shaped
+            # (rope-64) models keep the existing order.
+            from vllm.config import get_current_vllm_config_or_none
+
+            cfg = get_current_vllm_config_or_none()
+            hf = (
+                cfg.model_config.hf_text_config
+                if cfg is not None and cfg.model_config is not None
+                else None
+            )
+            if (
+                hf is not None
+                and getattr(hf, "qk_rope_head_dim", None) == 0
+                and getattr(hf, "index_topk", None) is not None
+            ):
+                return [
+                    AttentionBackendEnum.D512_SM120,
+                    AttentionBackendEnum.TRITON_MLA,
+                    AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,
+                ]
             return [
                 AttentionBackendEnum.TRITON_MLA,
                 AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,
