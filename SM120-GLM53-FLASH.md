@@ -90,7 +90,15 @@ Notes (from the verified overlay / serve.sh):
       one actually used).
 - [ ] No reuse of the old `pe_dim must be 64 for fp8_ds_mla` / DeepGEMM
       `block_kv==64` asserts on first decode (overlay's modes 1 & 4 are patched).
-- [ ] Greedy temp-0: two identical prompts -> identical, sane output.
+- [ ] Greedy temp-0 sanity: use a **wide-margin prompt** (e.g. an exact-copy
+      needle or arithmetic Q) and compare across modes (eager vs CUDA graphs vs
+      MTP) — NOT two separate runs: MoE+TP4 temp-0 is not bit-reproducible
+      across runs on open-ended prompts (soft argmax ties resolved by TP
+      reduction noise; #53963 determinism note). Wide-margin prompts are
+      bit-identical across modes.
+- [ ] Run with CUDA graphs + torch.compile (the production regime). Eager-only
+      numbers understate decode ~5-6x on SM120 (#53963 tmttodd), so don't judge
+      throughput from an eager boot.
 - [ ] Prefix-cache hit on a repeated prefix.
 - [ ] Needle-style long-context retrieval at ≥100k prompt tokens (the overlay
       passes at 527k; do at least one 100k+ run).
@@ -103,12 +111,21 @@ If it jams: `dump-jam-state.sh` is in the image; capture before touching anythin
 
 - **Checkpoint choice matters** (#54150): ModelOpt NVFP4 conversions emit
   invalid UTF-8 tokens; `RedHatAI/GLM-5.3-Flash-NVFP4` (compressed-tensors) is
-  clean. NVFP4 MoE on SM120 only served correctly by `marlin` (flashinfer_trtllm
-  / cutedsl reject the device; flashinfer_cutlass / cutlass / emulation collapse
-  to single-token loops). The staged native-FP8 checkpoint uses the fp8 path
-  above, so these matter only if you switch to NVFP4.
+  clean. NVFP4 MoE on SM120 only served correctly by `marlin` and only with it
+  passed explicitly (`--moe-backend marlin`; `auto`/others spin or collapse to
+  single-token loops - #53963/@53906 field reports). Marlin repack can OOM at
+  TP=2 (fixed by host-staged repack; relevant only if you go NVFP4 at <TP4).
+  The staged native-FP8 checkpoint uses the fp8 path above, so these matter
+  only if you switch to NVFP4.
+- **Stay at TP4 for this box.** A TP=2 report on the same overlay hung in the
+  MHC prenorm GEMM (both DeepGEMM and TileLang) at small warmup batches /
+  32-heads-per-rank geometry - every verified config here is TP4 (16
+  heads/rank), which doesn't hit it (#53963).
 - Upstream integration is still landing (PR #53906 open, unmerged); re-base and
-  drop the vendored pieces once a native family-120 NoPE lane exists.
+  drop the vendored pieces once a native family-120 NoPE lane exists. FlashInfer
+  is adding a natively rope-free SM120 path (flashinfer PR #4802 / #4791,
+  D_CKV=512 / D_ROPE=0) that would replace the 512->576 zero-pad; not yet in a
+  released flashinfer, so the pad stays for now.
 
 ## Runtime-overlay fallback (no rebuild)
 
