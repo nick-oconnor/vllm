@@ -124,8 +124,13 @@ If it jams: `dump-jam-state.sh` is in the image; capture before touching anythin
 - Upstream integration is still landing (PR #53906 open, unmerged); re-base and
   drop the vendored pieces once a native family-120 NoPE lane exists. FlashInfer
   is adding a natively rope-free SM120 path (flashinfer PR #4802 / #4791,
-  D_CKV=512 / D_ROPE=0) that would replace the 512->576 zero-pad; not yet in a
-  released flashinfer, so the pad stays for now.
+  D_CKV=512 / D_ROPE=0) that would replace the 512->576 zero-pad. **Decision
+  (2026-08-28): don't switch yet.** It fixes mode 1 only (cleaner + ~24% DSA-KV
+  capacity) and leaves mode 4, the indexer changes, PR #7, #54057 and the SM120
+  build untouched; it's an open/unreleased PR on an index pinned at 0.6.17
+  (would need a FlashInfer source build), and the current fp8 path is already
+  verified on this hardware. Revisit when #4802 ships in a released flashinfer
+  AND the tracked vLLM line adopts it.
 
 ## Runtime-overlay fallback (no rebuild)
 
