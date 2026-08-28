@@ -175,6 +175,45 @@ class DeepseekV4SparseMLAMetadataBuilder(
                 device=device,
             )
 
+            # ocnr: pre-compile the C128A topk metadata kernel before serving.
+            # With do_not_specialize (see the kernel decorator) this single launch
+            # at the maximum compressed width is the only variant that will ever
+            # need compiling, so no C128A kernel ever JIT-compiles mid-inference.
+            self._warmup_c128a_topk_kernel()
+
+    def _warmup_c128a_topk_kernel(self) -> None:
+        """Pre-compile ``_build_c128a_topk_metadata_kernel`` at init.
+
+        The kernel's ``max_compressed_tokens`` / ``num_decode_tokens`` scalars
+        are marked ``do_not_specialize``, so one launch here (at the maximum
+        width) compiles the only variant that will run. Without a warmup the first
+        long-context (>~512K) request hit a fresh JIT compile mid-inference on
+        one rank while the others proceeded -- stalling the engine. Running it here,
+        before serving, makes the kernel a startup cost instead of a runtime hang.
+        """
+        if self.compress_ratio != 128:
+            return
+        # Dummy inputs, dtype-matched to the real call sites so the compiled
+        # kernel is reused at runtime: positions/slot_mapping are int64;
+        # token-to-req / block-table / topk buffers are int32.
+        positions = torch.zeros(1, dtype=torch.int64, device=self.device)
+        req_indices = torch.zeros(1, dtype=torch.int32, device=self.device)
+        block_table = torch.zeros((1, 1), dtype=torch.int32, device=self.device)
+        slot_mapping = torch.zeros(1, dtype=torch.int64, device=self.device)
+        build_c128a_topk_metadata(
+            positions=positions,
+            compress_ratio=self.compress_ratio,
+            num_decode_tokens=0,
+            token_to_req_indices=req_indices,
+            block_table=block_table,
+            block_size=self.kv_cache_spec.block_size // self.compress_ratio,
+            slot_mapping=slot_mapping,
+            global_decode_buffer=self.c128a_global_decode_buffer,
+            decode_lens_buffer=self.c128a_decode_lens_buffer,
+            prefill_buffer=self.c128a_prefill_buffer,
+            max_compressed_tokens=self.c128a_max_compressed,
+        )
+
     def build(
         self,
         common_prefix_len: int,
@@ -351,7 +390,27 @@ def build_c128a_topk_metadata(
     return global_decode, decode_lens, prefill_local
 
 
-@triton.jit
+# ocnr: the scalar int args below are all *runtime* values (loop bounds,
+# per-token counts, pointer strides), but Triton specializes plain scalar ints by
+# value, putting them into the JIT compile key. `max_compressed_tokens` /
+# `global_decode_stride` / `prefill_local_stride` track `active_topk_width`, which
+# jumps at each power-of-two boundary of max_seq_len//128; the first long (>~512K)
+# request (width = c128a_max_compressed cap) hit a fresh mid-inference JIT
+# recompile on one rank while the others proceeded, stalling the engine (see
+# sm120-enablement notes: rank-0 C128A metadata-build jam). `num_decode_tokens`
+# varies every step and `block_table_stride` differs from the warmup's dummy
+# tensor, so all are marked do_not_specialize to give the kernel a single stable
+# compile key (only pointer dtypes + BLOCK_SIZE constexpr). Semantically a no-op:
+# every one is already used as a runtime value inside the kernel.
+@triton.jit(
+    do_not_specialize=[
+        "global_decode_stride",
+        "prefill_local_stride",
+        "max_compressed_tokens",
+        "num_decode_tokens",
+        "block_table_stride",
+    ]
+)
 def _build_c128a_topk_metadata_kernel(
     # Decode outputs
     global_decode_ptr,
