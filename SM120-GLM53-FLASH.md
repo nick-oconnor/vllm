@@ -66,6 +66,12 @@ Required env: `HF_HUB_OFFLINE=1`, `NCCL_P2P_LEVEL=NODE`, `VLLM_SSM_CONV_STATE_LA
 
 - [ ] sparse-MLA init + `Engine: ready` (expect the D512_SM120 lane selected; watch
       for the old `pe_dim must be 64 for fp8_ds_mla` == the FlashInfer lane leaking in)
+- [ ] first-decode Triton JIT: the d512 attention kernels compile on first use
+      (one-off multi-second stall). Send a tiny warmup request immediately after
+      `Engine ready`; if a TP rank-desync hang occurs on the very first request,
+      retry with `--enforce-eager` and capture `dump-jam-state.sh` before touching
+      anything (the shared conversion-kernel is pre-warmed; the d512 attention
+      kernels are the only lazy-compiled piece).
 - [ ] bf16 rope-free KV write through `concat_and_cache_mla` (the #53963 open item)
 - [ ] greedy temp-0 single turn: identical prompt twice -> identical, sane output
 - [ ] `prompt_tokens`/prefill sanity, prefix-cache hit on a repeated prompt (#53906 APC report)
