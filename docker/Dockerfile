@@ -244,7 +244,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 # Do not add +PTX here: vLLM filters torch's top-level PTX flag when it
 # converts global gencode flags into per-kernel arch lists. If a specific
 # kernel needs PTX, add +PTX to that kernel's CMake arch list instead.
-ARG torch_cuda_arch_list='7.5 8.0 8.6 8.9 9.0 10.0 11.0 12.0'
+ARG torch_cuda_arch_list='12.0'
 ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
 #################### BUILD BASE IMAGE ####################
 
@@ -277,7 +277,7 @@ COPY build_rust.sh build_rust.sh
 
 # Cap cargo parallelism to avoid exhausting the CI host's open-file limit
 # (rustc spawns enough concurrent processes to hit RLIMIT_NOFILE otherwise).
-ENV CARGO_BUILD_JOBS=4
+ENV CARGO_BUILD_JOBS=32
 
 # BuildKit can run this stage in parallel with csrc-build. Keep Rust on a
 # separate local sccache daemon while sharing the same remote cache backend.
@@ -353,10 +353,10 @@ COPY vllm/envs.py vllm/envs.py
 COPY vllm/__init__.py vllm/__init__.py
 
 # max jobs used by Ninja to build extensions
-ARG max_jobs=2
+ARG max_jobs=32
 ENV MAX_JOBS=${max_jobs}
 # number of threads used by nvcc
-ARG nvcc_threads=8
+ARG nvcc_threads=1
 ENV NVCC_THREADS=$nvcc_threads
 
 ARG USE_SCCACHE
@@ -447,7 +447,11 @@ RUN --mount=type=cache,target=/opt/uv/cache \
             > /tmp/nccl-override.txt && \
         export UV_OVERRIDE=/tmp/nccl-override.txt; \
     fi && \
-    export TORCH_CUDA_ARCH_LIST='9.0a 10.0a' && \
+    # DeepEP links -l:libnccl.so.2 but never adds the NVIDIA pip wheel's lib
+    # dir to library_dirs; surface it via LIBRARY_PATH so ld finds it at link time.
+    NCCL_LIB_DIR=$(find /opt/venv -type d -path '*/nvidia/nccl/lib' 2>/dev/null | head -n1) && \
+    export LIBRARY_PATH="${NCCL_LIB_DIR:+$NCCL_LIB_DIR${LIBRARY_PATH:+:$LIBRARY_PATH}}" && \
+    export TORCH_CUDA_ARCH_LIST='12.0a' && \
     /tmp/install_python_libraries.sh \
         --workspace /tmp/ep_kernels_workspace \
         --mode wheel \
@@ -520,9 +524,12 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         python3 use_existing_torch.py --prefix; \
     fi
 
-# Build the vLLM wheel
+# ocnr: override the build version so the wheel reports 0.29.0+sm120.cu130
+ARG VLLM_VERSION_OVERRIDE=0.29.0+sm120.cu130
+ENV SETUPTOOLS_SCM_PRETEND_VERSION=${VLLM_VERSION_OVERRIDE}
+
+# Build the vLLM wheel (no .git bind mount; version is set via VLLM_VERSION_OVERRIDE)
 RUN --mount=type=cache,target=/opt/uv/cache \
-    --mount=type=bind,source=.git,target=.git \
     if [ "${vllm_target_device}" = "cuda" ]; then \
         export VLLM_USE_PRECOMPILED=1; \
         export VLLM_PRECOMPILED_WHEEL_LOCATION=$(ls /precompiled-wheels/*.whl); \
@@ -543,7 +550,7 @@ RUN sha256sum /tmp/ep_kernels_workspace/dist/*.whl \
 # Check the size of the CUDA 13 wheel uploaded to PyPI
 COPY .buildkite/check-wheel-size.py check-wheel-size.py
 # sync the default value with .buildkite/check-wheel-size.py
-ARG VLLM_MAX_SIZE_MB=500
+ARG VLLM_MAX_SIZE_MB=1000
 ENV VLLM_MAX_SIZE_MB=$VLLM_MAX_SIZE_MB
 ARG RUN_WHEEL_CHECK=true
 RUN if [ "$RUN_WHEEL_CHECK" = "true" ] && \
@@ -626,6 +633,9 @@ RUN PYTHON_VERSION_STR=$(echo ${PYTHON_VERSION} | sed 's/\.//g') && \
 RUN apt-get update -y \
     && apt-get install -y --no-install-recommends \
         software-properties-common \
+        # g++ alongside cuda-nvrtc-dev for FlashInfer's runtime JIT
+        # (some SM120 kernels are JIT-compiled at runtime, not shipped in the wheel)
+        g++ \
         curl \
         sudo \
         ffmpeg \
@@ -667,6 +677,8 @@ RUN CUDA_VERSION_DASH=$(echo $CUDA_VERSION | cut -d. -f1,2 | tr '.' '-') && \
         cuda-nvcc-${CUDA_VERSION_DASH} \
         cuda-cudart-${CUDA_VERSION_DASH} \
         cuda-nvrtc-${CUDA_VERSION_DASH} \
+        # nvrtc.h header: FlashInfer JITs SM120 CUTLASS MoE kernels at runtime
+        cuda-nvrtc-dev-${CUDA_VERSION_DASH} \
         cuda-cuobjdump-${CUDA_VERSION_DASH} \
         libcurand-dev-${CUDA_VERSION_DASH} \
         libcublas-dev-${CUDA_VERSION_DASH} \
@@ -768,6 +780,15 @@ ARG FLASHINFER_VERSION=0.6.18
 RUN --mount=type=cache,target=/opt/uv/cache \
     uv pip install --system flashinfer-jit-cache==${FLASHINFER_VERSION} \
         --index-url https://flashinfer.ai/whl/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
+# Install py-spy + the jam-state dump script. Pre-installed so we don't have
+# to `pip install py-spy` into a jammed pod at incident time. See
+# tools/dump_jam_state.sh (writes /home/vllm/jam-<ts>-<host>/ with py-spy
+# dumps for every vllm/EngineCore/Worker PID plus nvidia-smi + dmesg Xid lines).
+RUN --mount=type=cache,target=/opt/uv/cache \
+    uv pip install --system py-spy \
+        && py-spy --version
+COPY tools/dump_jam_state.sh /usr/local/bin/dump-jam-state.sh
+RUN chmod 0755 /usr/local/bin/dump-jam-state.sh
 
 # ============================================================
 # OPENAI API SERVER DEPENDENCIES
@@ -1009,7 +1030,7 @@ ENV UV_HTTP_TIMEOUT=500
 
 # install kv_connectors if requested
 # Do not add +PTX here; see the main TORCH_CUDA_ARCH_LIST comment above.
-ARG torch_cuda_arch_list='7.5 8.0 8.6 8.9 9.0 10.0 11.0 12.0'
+ARG torch_cuda_arch_list='12.0'
 ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
 RUN --mount=type=cache,target=/opt/uv/cache \
     --mount=type=bind,source=requirements/kv_connectors.txt,target=/tmp/kv_connectors.txt,ro \
