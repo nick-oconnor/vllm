@@ -34,6 +34,10 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
 
     is_sparse = True
     supports_dense_mha_prefill = False
+    # SM120 sparse MLA has no masked-MHA prefill kernel; declare it so the
+    # prefill dispatcher short-circuits instead of reading a missing attribute
+    # at startup profiling (vllm-project/vllm#54057).
+    masked_mha_available = False
 
     def __init__(
         self,
