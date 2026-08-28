@@ -160,7 +160,8 @@ class FlashInferMLASparseSM120Backend(_FlashInferMLASparseBackendBase):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        return [64, 256]
+        # SM120 GLM_NSA/DSV3_2 kernels are instantiated at PAGE_BLOCK_SIZE=64 only.
+        return [64]
 
     @staticmethod
     def get_impl_cls() -> type[MLAAttentionImpl]:
@@ -214,19 +215,14 @@ class FlashInferMLASparseSM120Backend(_FlashInferMLASparseBackendBase):
                     "FLASHINFER_MLA_SPARSE_SM120 requires a model with "
                     "index_topk config"
                 )
-            # The kernel is instantiated for an index width of exactly 2048,
-            # but what reaches it is the topk BUFFER width: index_topk plus the
-            # kpool always-selected tail (kpool - 1), rounded up to a multiple
-            # of 128 by the indexer's buffer allocation. Validate that
-            # effective width, not the raw config value.
-            kpool = getattr(hf_text_config, "index_kpool", 1) or 1
-            eff_width = int(index_topk) + (kpool - 1 if kpool > 1 else 0)
-            eff_width = ((eff_width + 127) // 128) * 128
-            if eff_width != 2048:
+            # GLM_NSA/DSV3_2 kernels are instantiated for topk == 2048 only
+            # (a template parameter), and the model's indexer buffer is pinned
+            # to exactly index_topk (no kpool extension), so the raw value is
+            # what reaches the kernel.
+            if int(index_topk) != 2048:
                 return (
-                    "FLASHINFER_MLA_SPARSE_SM120 requires an effective topk "
-                    f"buffer width of 2048; got {eff_width} "
-                    f"(index_topk={index_topk}, index_kpool={kpool})"
+                    "FLASHINFER_MLA_SPARSE_SM120 requires index_topk=2048; "
+                    f"got {index_topk}"
                 )
         return None
 

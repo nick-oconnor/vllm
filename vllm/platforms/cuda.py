@@ -128,11 +128,11 @@ def _get_backend_priorities(
                 *sparse_backends,
             ]
         elif device_capability.major == 12:
-            # GLM-5.3-Flash-style rope-free sparse MLA (qk_rope_head_dim == 0)
-            # has no family-120 kernel on the FlashInfer fp8_ds_mla lane; the
-            # staged effective topk width (index_topk=2048, kpool=4 -> padded
-            # 2176) also exceeds the 2048 the lane is instantiated for. Prefer
-            # the indexed d512 Triton lane for NoPE models; DeepSeek-shaped
+            # Rope-free (NoPE, qk_rope_head_dim == 0) sparse MLA is served by
+            # FLASHINFER_MLA_SPARSE_SM120 via the GLM_NSA zero-pad (fp8 KV,
+            # the hardware-verified path for GLM-5.3-Flash on SM120). The
+            # indexed d512 Triton lane is a bf16-capable fallback and stays
+            # at the tail so it can never hijack an fp8 launch. DeepSeek-shaped
             # (rope-64) models keep the existing order.
             from vllm.config import get_current_vllm_config_or_none
 
@@ -148,9 +148,9 @@ def _get_backend_priorities(
                 and getattr(hf, "index_topk", None) is not None
             ):
                 return [
-                    AttentionBackendEnum.D512_SM120,
-                    AttentionBackendEnum.TRITON_MLA,
                     AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,
+                    AttentionBackendEnum.TRITON_MLA,
+                    AttentionBackendEnum.D512_SM120,
                 ]
             return [
                 AttentionBackendEnum.TRITON_MLA,
@@ -463,10 +463,18 @@ class CudaPlatformBase(Platform):
             return None
         from vllm.utils.deep_gemm import PAGED_MQA_PAGE_SIZES
 
+        page_sizes = PAGED_MQA_PAGE_SIZES
+        capability = cls.get_device_capability()
+        if capability is not None and capability.major == 12:
+            # SM120: DeepGEMM paged-MQA asserts block_kv == 64 for the kpool
+            # storage block (block_size // index_kpool). Restrict the page
+            # sizes so block_size aligns to index_kpool * 64, making the
+            # storage block tile by 64 (1792 -> 448 when index_kpool=4).
+            page_sizes = tuple(p for p in page_sizes if p == 64)
         # kpool paged-MQA indexer: the storage block (block_size /
         # index_kpool) is virtually split into pool pages, so block_size
-        # must be a multiple of index_kpool * min(PAGED_MQA_PAGE_SIZES).
-        return index_kpool * min(PAGED_MQA_PAGE_SIZES)
+        # must be a multiple of index_kpool * min(page_sizes).
+        return index_kpool * min(page_sizes)
 
     @classmethod
     def get_attn_backend_cls(

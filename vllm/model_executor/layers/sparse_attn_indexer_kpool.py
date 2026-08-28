@@ -596,7 +596,7 @@ def sparse_attn_indexer_kpool(
                         + 1
                     )
                     expanded = kpool_ops.expand_pools_and_append_tail(
-                        pool_ids, q_seq, index_kpool
+                        pool_ids[:, : select_k - 1], q_seq, index_kpool
                     )
                 else:
                     valid = pool_ids >= 0
@@ -880,7 +880,9 @@ def sparse_attn_indexer_kpool(
                 if dec_seq.ndim == 2:
                     dec_seq = dec_seq[:, -1]
                 dec_seq = dec_seq.to(torch.int32)
-            out = kpool_ops.expand_pools_and_append_tail(pool_ids, dec_seq, index_kpool)
+            out = kpool_ops.expand_pools_and_append_tail(
+                pool_ids[:, : select_k - 1], dec_seq, index_kpool
+            )
         else:
             out = topk_dst
 
