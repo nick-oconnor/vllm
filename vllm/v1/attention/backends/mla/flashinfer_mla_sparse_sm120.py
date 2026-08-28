@@ -22,6 +22,8 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
 if TYPE_CHECKING:
     from vllm.model_executor.models.deepseek_v2 import Indexer
 
+_DS_ROPE_DIM = 64  # rope section width of the fixed 656-byte fp8_ds_mla tile
+
 
 def _kv_scale_format_for_model(model_type: str | None) -> str:
     if model_type is not None and model_type.startswith("glm"):
@@ -78,6 +80,10 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
         self.kv_lora_rank: int = mla_args["kv_lora_rank"]
         self.qk_nope_head_dim: int = mla_args["qk_nope_head_dim"]
         self.qk_rope_head_dim: int = mla_args["qk_rope_head_dim"]
+        # NoPE models (GLM-5.3-Flash): pad the rope section with zeros to fit
+        # the DS-shaped fp8_ds_mla tile. Exact: a zero rope contributes 0 to
+        # the q_pe.k_pe dot product, so scores are bit-for-bit unchanged.
+        self._nope_pad = self.qk_rope_head_dim == 0
         from vllm.config import get_current_vllm_config
 
         vllm_config = get_current_vllm_config()
@@ -107,6 +113,30 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
         self.supports_quant_query_input = False
         self._workspace_buffer: torch.Tensor | None = None
 
+    def do_kv_cache_update(
+        self,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        kv_cache_dtype: str,
+        k_scale: torch.Tensor,
+    ) -> None:
+        if kv_cache.numel() == 0:
+            return
+        if self._nope_pad and k_pe.size(-1) == 0:
+            k_pe = k_pe.new_zeros((*k_pe.shape[:-1], _DS_ROPE_DIM))
+        from vllm import _custom_ops as ops
+
+        ops.concat_and_cache_mla(
+            kv_c_normed,
+            k_pe.squeeze(1),
+            kv_cache,
+            slot_mapping.flatten(),
+            kv_cache_dtype=kv_cache_dtype,
+            scale=k_scale,
+        )
+
     def forward_mqa(
         self,
         q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
@@ -118,6 +148,11 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
             q = torch.cat(q, dim=-1)
 
         num_actual_toks = q.shape[0]
+
+        rope_dim = self.qk_rope_head_dim
+        if self._nope_pad:
+            q = torch.nn.functional.pad(q, (0, _DS_ROPE_DIM))
+            rope_dim = _DS_ROPE_DIM
 
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
@@ -145,20 +180,25 @@ class FlashInferMLASparseSM120Impl(MLAAttentionImpl[FlashInferMLASparseMetadata]
             flashinfer_trtllm_batch_decode_with_kv_cache_mla,
         )
 
+        # The indexer's kpool widens the index buffer past index_topk
+        # (always-selected tail slots, padded up by the buffer allocation).
+        # Pass the buffer's real width so the kernel's shape check matches.
+        eff_topk = topk_indices_physical.shape[-1]
+
         out = flashinfer_trtllm_batch_decode_with_kv_cache_mla(
             query=q.unsqueeze(1),
             kv_cache=kv_c_and_k_pe_cache.view(torch.uint8).unsqueeze(1),
             workspace_buffer=self._workspace_buffer,
             qk_nope_head_dim=self.qk_nope_head_dim,
             kv_lora_rank=self.kv_lora_rank,
-            qk_rope_head_dim=self.qk_rope_head_dim,
+            qk_rope_head_dim=rope_dim,
             block_tables=topk_indices_physical.unsqueeze(1),
             seq_lens=None,
-            max_seq_len=attn_metadata.topk_tokens,
+            max_seq_len=eff_topk,
             out=output.unsqueeze(1),
             bmm1_scale=self.scale,
             bmm2_scale=1.0,
-            sparse_mla_top_k=attn_metadata.topk_tokens,
+            sparse_mla_top_k=eff_topk,
             kv_scale_format=self.kv_scale_format,
         )
         return out.squeeze(1), None
