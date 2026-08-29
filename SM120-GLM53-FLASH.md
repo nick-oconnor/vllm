@@ -14,7 +14,7 @@ this branch adds the ocnr/SM120 deltas below. See `git log --oneline 0.29 ^glm5/
 
 | Commit | What | Why |
 |---|---|---|
-| FlashInfer 0.6.17 -> 0.6.18 | requirements/cuda.txt, docker/Dockerfile | NoPE sparse-MLA init requires >= 0.6.18 (recipe troubleshooting) |
+| FlashInfer **pinned at 0.6.17** | requirements/cuda.txt, docker/Dockerfile, versions.json | 0.6.17 is the latest resolvable version on https://flashinfer.ai/whl/ (the recipe's ">= 0.6.18" is not yet published there). Matches the `glm53-flash` reference image and the #53963 SM120 test env; the d512 lane is pure Triton and the fp8 no-rope lane works on 0.6.17 |
 | `masked_mha_available=False` on SM120 impl | #54057 backport | SM120 startup-profiling AttributeError |
 | persistent kpool slot mapping + `positions` | ZJY0516/vllm#7 backport | fp8_fp4_mqa_logits CUDA_ERROR_ILLEGAL_ADDRESS past topk; CUDA-graph kpool fault |
 | NoPE on FLASHINFER_MLA_SPARSE_SM120 | #53969 (surgical) | zero-pad rope write/query (bit-exact); effective-topk-width check |
