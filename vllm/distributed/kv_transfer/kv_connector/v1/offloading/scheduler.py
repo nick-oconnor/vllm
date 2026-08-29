@@ -104,6 +104,11 @@ class GroupOffloadConfig(NamedTuple):
     # of these groups is volatile and lacks a stable hash, so it must
     # be excluded from store and load scheduling.
     is_eagle_group: bool = False
+    # False for groups outside the prefix-cache hash chain (e.g. GLM-5.3's
+    # kpool tail, block 4 << tokens_per_hash). Such groups cannot be hashed
+    # or chunked at the global hash granularity, so they are never offloaded
+    # and stay GPU-resident (see update_offload_keys / storable_chunks).
+    participates_in_prefix_caching: bool = True
 
 
 def get_sliding_window_size_in_chunks(
@@ -167,6 +172,25 @@ def resolve_mamba_align_size(
             assert mamba_align_size is None or mamba_align_size == tokens_per_chunk
             mamba_align_size = tokens_per_chunk
     return mamba_align_size
+
+
+def _offload_group_hashes_per_chunk(
+    kv_spec: KVCacheSpec,
+    tokens_per_block: int,
+    blocks_per_chunk: int,
+    tokens_per_hash: int,
+) -> int:
+    """Hashes per offload chunk for one KV cache group.
+
+    Participating groups align to the global ``tokens_per_hash`` (their block
+    size is a multiple of it; enforced by ``build_offloading_config``). Groups
+    that opt out of prefix caching (e.g. GLM-5.3's kpool tail, block 4) cannot
+    align to the coarse hash and hash at their own block granularity, one hash
+    per block, so ``hashes_per_chunk`` never underflows.
+    """
+    if not kv_spec.participates_in_prefix_caching:
+        return blocks_per_chunk
+    return (tokens_per_block * blocks_per_chunk) // tokens_per_hash
 
 
 class SchedulerOffloadConfig(NamedTuple):
@@ -250,9 +274,11 @@ class SchedulerOffloadConfig(NamedTuple):
                     group_idx=idx,
                     tokens_per_block=tokens_per_block,
                     tokens_per_chunk=tokens_per_block * spec.blocks_per_chunk,
-                    hashes_per_chunk=(
-                        (tokens_per_block * spec.blocks_per_chunk)
-                        // spec.tokens_per_hash
+                    hashes_per_chunk=_offload_group_hashes_per_chunk(
+                        kv_spec,
+                        tokens_per_block,
+                        spec.blocks_per_chunk,
+                        spec.tokens_per_hash,
                     ),
                     sliding_window_size_in_chunks=sw,
                     alignment_chunk_count=_alignment_chunk_count(
@@ -260,6 +286,9 @@ class SchedulerOffloadConfig(NamedTuple):
                     ),
                     kv_event_group_spec=get_offloading_event_group_spec(kv_cache_group),
                     is_eagle_group=idx in eagle_groups,
+                    participates_in_prefix_caching=(
+                        kv_cache_group.kv_cache_spec.participates_in_prefix_caching
+                    ),
                     requires_cow_source=(
                         isinstance(kv_spec, MambaSpec)
                         and kv_spec.mamba_cache_mode == "align"
@@ -357,6 +386,8 @@ class RequestOffloadState:
         for group_config, group_state in zip(
             self.config.kv_group_configs, self.group_states
         ):
+            if not group_config.participates_in_prefix_caching:
+                continue
             for req_block_hash in islice(
                 self.req.block_hashes,
                 group_config.hashes_per_chunk * len(group_state.offload_keys)
@@ -398,6 +429,8 @@ class RequestOffloadState:
         ``next_stored_chunk_idx``, so it is never re-considered and a
         permanent hole breaks prefix-reuse lookup.
         """
+        if not group_config.participates_in_prefix_caching:
+            return 0
         num_chunks = num_offloadable_tokens // group_config.tokens_per_chunk
         is_decoding = num_offloadable_tokens > self.req.num_prompt_tokens
         if group_config.is_eagle_group and is_decoding:
@@ -423,6 +456,8 @@ class RequestOffloadState:
         for group_config, group_state in zip(
             self.config.kv_group_configs, self.group_states
         ):
+            if not group_config.participates_in_prefix_caching:
+                continue
             group_state.num_hit_chunks = (
                 num_cached_tokens // group_config.tokens_per_chunk
             )
@@ -504,6 +539,11 @@ class OffloadingConnectorScheduler:
         full_attention_groups: list[int] = []
         sliding_window_groups: list[int] = []
         for group_config in self.config.kv_group_configs:
+            # Non-participating groups (e.g. GLM-5.3's kpool tail) carry no
+            # offload keys; keep them out of lookup so the key-size invariants
+            # in _lookup_complete_chunks hold. Their KV stays GPU-resident.
+            if not group_config.participates_in_prefix_caching:
+                continue
             if group_config.sliding_window_size_in_chunks is None:
                 full_attention_groups.append(group_config.group_idx)
             else:
@@ -667,6 +707,8 @@ class OffloadingConnectorScheduler:
         for group_config, group_state in zip(
             self.config.kv_group_configs, req_status.group_states
         ):
+            if not group_config.participates_in_prefix_caching:
+                continue
             if group_config.sliding_window_size_in_chunks is None:
                 self.manager.touch(group_state.offload_keys, req_status.req_context)
             else:
@@ -1018,6 +1060,15 @@ class OffloadingConnectorScheduler:
                 block.block_id for block in group_blocks if block.block_id != 0
             )
 
+            if not group_config.participates_in_prefix_caching:
+                # Non-participating groups (e.g. GLM-5.3's kpool tail) have a
+                # block count unrelated to the request's token span and are
+                # never offloaded. Keep the per-group arrays aligned with a
+                # zero-size entry and skip all the block/key accounting below.
+                group_sizes.append(0)
+                block_indices.append(0)
+                continue
+
             tokens_per_block = group_config.tokens_per_block
             tokens_per_chunk = group_config.tokens_per_chunk
             offload_keys = group_state.offload_keys
@@ -1025,7 +1076,9 @@ class OffloadingConnectorScheduler:
 
             assert len(group_blocks) >= num_gpu_blocks
             num_locally_computed_gpu_blocks = num_gpu_blocks
-            # Skip null placeholder blocks (used for sliding window or mamba padding).
+            # Skip null placeholder blocks (used for sliding window or mamba
+            # padding). Participation is guaranteed here: non-participating
+            # groups were skipped above.
             for i, block in enumerate(group_blocks[:num_gpu_blocks]):
                 if not block.is_null and block.block_hash is None:
                     num_locally_computed_gpu_blocks = i
@@ -1056,7 +1109,9 @@ class OffloadingConnectorScheduler:
                 if partial_tail_boundary is not None:
                     keys_to_load.append(
                         self._make_boundary_key(
-                            request, group_config.group_idx, partial_tail_boundary
+                            request,
+                            group_config.group_idx,
+                            partial_tail_boundary,
                         )
                     )
 

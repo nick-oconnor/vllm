@@ -51,7 +51,15 @@ def build_offloading_config(
     )
 
     _, tokens_per_hash = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
-    for group in groups:
+    # tokens_per_hash is the hash granularity over *participating* groups only
+    # (resolve_kv_cache_block_sizes excludes groups that opt out of prefix
+    # caching). Groups that don't participate (e.g. GLM-5.3's kpool tail, block
+    # 4) cannot align to the coarse hash -- they are hashed at their own block
+    # granularity by the scheduler (see _offload_group_hashes_per_chunk) -- so
+    # only enforce divisibility for groups that actually participate.
+    for group, cache_group in zip(groups, kv_cache_config.kv_cache_groups):
+        if not cache_group.kv_cache_spec.participates_in_prefix_caching:
+            continue
         assert group.tokens_per_block % tokens_per_hash == 0, (
             f"tokens_per_block={group.tokens_per_block} not divisible by "
             f"tokens_per_hash={tokens_per_hash}. "
