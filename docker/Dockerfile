@@ -1061,6 +1061,12 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         fi; \
     fi
 
+# b12x: SM12x CuTe-DSL kernels. Provides the PCIe oneshot all-reduce runtime
+# (b12x.comm.pcie) used by CustomAllreduce when VLLM_ENABLE_PCIE_ALLREDUCE=1.
+# All dependency pins (torch>=2.12, cutlass-dsl==4.6.2, tvm-ffi) are already
+# satisfied by the vllm-base stage; nothing upstream is upgraded.
+RUN uv pip install --system "b12x==1.3.0"
+
 # Mooncake registers GPU memory for RDMA via nvidia-peermem by default. Hosts
 # without that module loaded (e.g. GB200) must pass WITH_NVIDIA_PEERMEM=0 at run
 # time; see docs/features/mooncake_connector_usage.md. Deliberately not an ENV

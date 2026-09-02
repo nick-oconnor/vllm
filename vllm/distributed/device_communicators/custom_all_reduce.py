@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from contextlib import contextmanager
 from typing import cast
 
@@ -91,6 +92,9 @@ class CustomAllreduce:
         self._IS_CAPTURING = False
         self._ptr = 0
         self.disabled = True
+        self._pcie = None
+        self._pcie_dma = None
+        self._pcie_allreduce_max_size = 0
         self.mnnvl_buffer = None
         self.mnnvl_handle = None
         self.mnnvl_peer_buffers: list[torch.Tensor] | None = None
@@ -176,7 +180,52 @@ class CustomAllreduce:
             physical_device_ids = [t.item() for t in gather_list]
             assert current_platform.is_cuda_alike()
             fully_connected = current_platform.is_fully_connected(physical_device_ids)
-        if same_node and world_size > 2 and not fully_connected:
+        # b12x PCIe oneshot backend: the only custom-AR path that supports
+        # TP>2 on PCIe-only topologies. Enabled via VLLM_ENABLE_PCIE_ALLREDUCE.
+        self._pcie = None
+        self._pcie_dma = None
+        self._pcie_allreduce_max_size = 0
+        pcie_active = False
+        if (
+            same_node
+            and os.environ.get("VLLM_ENABLE_PCIE_ALLREDUCE", "0") not in ("", "0")
+        ):
+            try:
+                from b12x.comm.pcie import AllReduce as PCIeAllReduce
+                from b12x.comm.pcie import is_supported as pcie_is_supported
+
+                if not pcie_is_supported(self.device):
+                    logger.warning_once(
+                        "b12x PCIe allreduce requested but unsupported "
+                        "on this device"
+                    )
+                else:
+                    self._pcie = PCIeAllReduce.from_process_group(
+                        process_group=self.group,
+                        device=self.device,
+                        max_size=max_size,
+                        # vLLM captures all cudagraphs inside one
+                        # graph_capture() phase; the single semantic channel
+                        # is the supported mode for that flow
+                        single_channel=True,
+                    )
+                    self._pcie_allreduce_max_size = max_size
+                    pcie_active = True
+                    logger.info_once(
+                        "b12x PCIe oneshot allreduce enabled "
+                        "(algorithm=%s, world_size=%d)",
+                        self._pcie.algorithm,
+                        world_size,
+                    )
+            except Exception as e:
+                logger.warning("b12x PCIe allreduce init failed: %s", e)
+                self._pcie = None
+        if (
+            same_node
+            and world_size > 2
+            and not fully_connected
+            and not pcie_active
+        ):
             logger.warning(
                 "Custom allreduce is disabled because it's not supported on"
                 " more than two PCIe-only GPUs. To silence this warning, "
@@ -197,6 +246,19 @@ class CustomAllreduce:
                 "GPU P2P capability or P2P test failed. To silence this "
                 "warning, specify disable_custom_all_reduce=True explicitly."
             )
+            return
+        if pcie_active:
+            self.disabled = False
+            self.max_size = max_size
+            self.max_all_gather_size = max_all_gather_size
+            if max_mnnvl_all_gather_size is None:
+                max_mnnvl_all_gather_size = self._DEFAULT_MNNVL_ALL_GATHER_MAX_SIZES[
+                    world_size
+                ]
+            self.max_mnnvl_all_gather_size = max_mnnvl_all_gather_size
+            self.max_reduce_scatter_size = max_reduce_scatter_size
+            self.max_mnnvl_reduce_scatter_size = max_mnnvl_reduce_scatter_size
+            self.fully_connected = fully_connected
             return
 
         self.disabled = False
@@ -318,6 +380,10 @@ class CustomAllreduce:
         `register_graph_buffers` call at the end of the context.
         It records all the buffer addresses used in the CUDA graph.
         """
+        if self._pcie is not None:
+            with self._pcie.capture():
+                yield
+            return
         try:
             self._IS_CAPTURING = True
             yield
@@ -346,6 +412,19 @@ class CustomAllreduce:
         ops.register_graph_buffers(self._ptr, handles, offsets)
 
     def should_custom_ar(self, inp: torch.Tensor):
+        if self._pcie is not None:
+            if self.disabled or inp.dtype not in (
+                torch.float32,
+                torch.float16,
+                torch.bfloat16,
+            ):
+                return False
+            if inp.numel() * inp.element_size() % 16 != 0:
+                return False
+            if not is_weak_contiguous(inp):
+                return False
+            # the pool routes the transport internally; vLLM decides by size
+            return inp.numel() * inp.element_size() <= self._pcie_allreduce_max_size
         if self.disabled or self.world_size > 8:
             return False
         inp_size = inp.numel() * inp.element_size()
@@ -381,6 +460,10 @@ class CustomAllreduce:
 
     def custom_all_reduce(self, input: torch.Tensor) -> torch.Tensor | None:
         """The main allreduce API that provides support for cuda graph."""
+        if self._pcie is not None:
+            if self.disabled or not self.should_custom_ar(input):
+                return None
+            return self._pcie.all_reduce(input)
         # When custom allreduce is disabled, this will be None.
         if self.disabled or not self.should_custom_ar(input):
             return None
@@ -503,6 +586,9 @@ class CustomAllreduce:
         return out
 
     def close(self):
+        if self._pcie is not None:
+            self._pcie.close()
+            self._pcie = None
         if not self.disabled and self._ptr:
             if ops is not None:
                 ops.dispose(self._ptr)
