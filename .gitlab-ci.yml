@@ -1,0 +1,52 @@
+workflow:
+  rules:
+  - if: $CI_PIPELINE_SOURCE == 'schedule'
+  - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+stages:
+- renovate
+- build
+
+renovate:
+  stage: renovate
+  image: ${CI_REGISTRY}/infra/renovate:latest
+  variables:
+    RENOVATE_TOKEN: ${BUILD_TOKEN}
+    RENOVATE_PLATFORM_COMMIT: "true"
+    RENOVATE_CONFIG_VALIDATION_ERROR: "true"
+    RENOVATE_THROW_ERRORS: "true"
+    LOG_LEVEL: "debug"
+  script:
+  - renovate ${CI_PROJECT_PATH}
+  rules:
+  - if: $CI_PIPELINE_SOURCE == 'schedule'
+build:
+  stage: build
+  image: ${CI_REGISTRY}/infra/docker:latest
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  timeout: 6 hours
+  before_script:
+  - |
+    for i in $(seq 1 30); do
+      docker info >/dev/null 2>&1 && break
+      sleep 1
+    done
+    docker login -u build-token -p "${BUILD_TOKEN}" "${CI_REGISTRY}"
+    docker buildx create --use --driver docker-container --driver-opt image=moby/buildkit:latest
+    export CONTAINER_TAG=$(cat VERSION | sed 's/^v//; s/^.*://; s/+/-/; s/\.cu/-cu/')
+    export CACHE_REF="registry.ocnr.org/infra/container-cache:vllm-${CI_COMMIT_BRANCH}"
+    export TAG_ARGS="-t ${CI_REGISTRY_IMAGE}:${CONTAINER_TAG} -t ${CI_REGISTRY_IMAGE}:${CI_COMMIT_BRANCH}"
+  script:
+  - |
+    docker buildx build \
+      --cache-from "type=registry,ref=${CACHE_REF}" \
+      --cache-to "type=registry,ref=${CACHE_REF},mode=max" \
+      ${TAG_ARGS} \
+      -f docker/Dockerfile \
+      --push .
+  rules:
+  - if: $CI_PIPELINE_SOURCE == 'schedule'
+    when: never
+  - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    changes: ["VERSION", ".buildkite/check-wheel-size.py", "CMakeLists.txt", "benchmarks/**/*", "build_rust.sh", "cmake/**/*", "csrc/**/*", "docker/**/*", "examples/**/*", "pyproject.toml", "requirements/**/*", "rust-toolchain.toml", "rust/**/*", "setup.py", "tools/**/*", "use_existing_torch.py", "vllm/**/*"]
