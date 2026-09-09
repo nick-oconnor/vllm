@@ -161,7 +161,10 @@ class FlashInferMLASparseSM120Backend(_FlashInferMLASparseBackendBase):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        return [64, 256]
+        # SM120 GLM_NSA/DSV3_2 kernels are instantiated at PAGE_BLOCK_SIZE=64
+        # only (hardware-verified on 4x RTX PRO 6000; the 256 page selects a
+        # kernel shape that does not exist for this arch).
+        return [64]
 
     @staticmethod
     def get_impl_cls() -> type[MLAAttentionImpl]:
