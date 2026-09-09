@@ -129,6 +129,29 @@ def _get_backend_priorities(
                 *sparse_backends,
             ]
         elif device_capability.major == 12:
+            # Rope-free (NoPE, qk_rope_head_dim == 0) sparse MLA is served by
+            # FLASHINFER_MLA_SPARSE_SM120 via the GLM_NSA zero-pad (fp8 KV,
+            # the hardware-verified path for GLM-5.3-Flash on SM120); keep it
+            # ahead of TRITON_MLA so an fp8+sparse launch can never be
+            # hijacked. DeepSeek-shaped (rope-64) models keep the default
+            # order.
+            from vllm.config import get_current_vllm_config_or_none
+
+            cfg = get_current_vllm_config_or_none()
+            hf = (
+                cfg.model_config.hf_text_config
+                if cfg is not None and cfg.model_config is not None
+                else None
+            )
+            if (
+                hf is not None
+                and getattr(hf, "qk_rope_head_dim", None) == 0
+                and getattr(hf, "index_topk", None) is not None
+            ):
+                return [
+                    AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,
+                    AttentionBackendEnum.TRITON_MLA,
+                ]
             return [
                 AttentionBackendEnum.TRITON_MLA,
                 AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,

@@ -218,6 +218,11 @@ class FlashInferMLASparseSM120Backend(_FlashInferMLASparseBackendBase):
                     "FLASHINFER_MLA_SPARSE_SM120 requires a model with "
                     "index_topk config"
                 )
+            # GLM_NSA/DSV3_2 kernels are instantiated for topk == 2048 only
+            # (a template parameter). On SM120 the glm5next model pins its
+            # indexer buffer to exactly index_topk (the kpool indexer drops
+            # the lowest-ranked pool on this arch), so the raw config value
+            # is what reaches the kernel.
             if int(index_topk) != 2048:
                 return (
                     "FLASHINFER_MLA_SPARSE_SM120 requires index_topk=2048; "

@@ -39,6 +39,7 @@ is retired — upstream main now carries the model plus follow-ups (#55119 EPLB,
 | b12x PCIe oneshot allreduce | `VLLM_ENABLE_PCIE_ALLREDUCE=1`: the only custom-AR path supporting TP>2 on PCIe-only topologies (4x RTX PRO 6000 have no NVLink); installs `b12x==1.3.0` |
 | masked_mha_available=False | #54057 (still open): SM120 startup AttributeError in the prefill dispatcher |
 | SM120 kernel block size [64] | the SM120 GLM_NSA/DSv3.2 kernels are instantiated at PAGE_BLOCK_SIZE=64 only |
+| NoPE backend priority | for NoPE+sparse models on major==12, FLASHINFER_MLA_SPARSE_SM120 is tried before TRITON_MLA (upstream's default order is TRITON_MLA first; rope-64 DeepSeek-shaped models keep the default) |
 | **NoPE on FLASHINFER_MLA_SPARSE_SM120** | zero-pad q and k_pe into the 576 geometry (`do_kv_cache_update` + `forward_mqa`); `return_valid_counts` + `seq_lens=valid counts` + empty-row handling; kpool indexer drops the lowest-ranked pool on family-120 and glm5next model/mtp pin the buffer width to `index_topk` (the fp8_ds_mla trtllm-gen kernel is instantiated for exactly 2048). The SM100 native-nope lane (nope_mla_dimensions, generic topk) is untouched |
 | SM120 build config | VERSION 0.29.0+sm120.cu130, GitLab CI, Dockerfile (arch 12.0, DeepEP 12.0a + NCCL LIBRARY_PATH fix, MAX_JOBS=32/NVCC_THREADS=1, g++ + cuda-nvrtc-dev for runtime JIT, py-spy + dump-jam-state.sh) |
 
