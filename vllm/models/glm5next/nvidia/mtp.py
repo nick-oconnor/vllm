@@ -54,7 +54,14 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
         assert topk_tokens is not None
         kpool = config.index_kpool
         assert kpool is not None
-        buffer_width = topk_tokens + (kpool - 1 if kpool > 1 else 0)
+        if current_platform.is_device_capability_family(120):
+            # SM120: the fp8_ds_mla trtllm-gen kernel is instantiated for an
+            # index width of exactly index_topk, and the kpool indexer drops
+            # the lowest-ranked pool on this arch so the always-selected tail
+            # fits without extra headroom.
+            buffer_width = topk_tokens
+        else:
+            buffer_width = topk_tokens + (kpool - 1 if kpool > 1 else 0)
         sparse_topk_block_n = 128
         buffer_width = (
             (buffer_width + sparse_topk_block_n - 1) // sparse_topk_block_n

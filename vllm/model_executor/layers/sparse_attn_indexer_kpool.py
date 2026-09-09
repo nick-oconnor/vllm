@@ -4,6 +4,8 @@
 
 from typing import TYPE_CHECKING
 
+import functools
+
 import torch
 
 import vllm.envs as envs
@@ -42,6 +44,22 @@ elif current_platform.is_xpu():
 logger = init_logger(__name__)
 
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
+
+
+@functools.cache
+def _sm120_pools_drop_lowest() -> bool:
+    """Whether the kpool indexer should drop its lowest-ranked pool.
+
+    On SM120 the fp8_ds_mla trtllm-gen kernel is instantiated for an index
+    width of exactly ``index_topk``; dropping the lowest-ranked pool makes the
+    always-selected tail fit that width, and the glm5next model pins its
+    buffer to ``index_topk`` accordingly. Other archs keep the full pool set
+    and the (kpool - 1)-wider buffer.
+    """
+    return current_platform.is_cuda_alike() and (
+        current_platform.is_device_capability_family(120)
+    )
+
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
@@ -569,6 +587,15 @@ def sparse_attn_indexer_kpool(
 
             if index_kpool > 1:
                 pool_ids = pool_topk.to(torch.int64)
+                if _sm120_pools_drop_lowest():
+                    # SM120: the fp8_ds_mla trtllm-gen kernel is instantiated
+                    # for an index width of exactly index_topk. Dropping the
+                    # lowest-ranked pool frees exactly one pool row so the
+                    # always-selected tail fits:
+                    # (select_k - 1) * kpool + (kpool - 1) == topk_tokens - 1.
+                    # The glm5next model pins the buffer width to index_topk
+                    # on this arch to match.
+                    pool_ids = pool_ids[:, : select_k - 1]
                 if positions is not None:
                     # Fused expand-pools + append-tail into one Triton kernel
                     # (replaces ~25 elementwise ops). seq_len is token-granular
@@ -862,6 +889,11 @@ def sparse_attn_indexer_kpool(
                 if dec_seq.ndim == 2:
                     dec_seq = dec_seq[:, -1]
                 dec_seq = dec_seq.to(torch.int32)
+            if _sm120_pools_drop_lowest():
+                # See the prefill-side call above: SM120 pins the kernel's
+                # index width to index_topk, so the lowest-ranked pool is
+                # dropped to make room for the always-selected tail.
+                pool_ids = pool_ids[:, : select_k - 1]
             out = kpool_ops.expand_pools_and_append_tail(pool_ids, dec_seq, index_kpool)
         else:
             out = topk_dst
