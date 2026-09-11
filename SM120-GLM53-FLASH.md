@@ -62,39 +62,51 @@ git switch 0.29
 git push origin 0.29   # GitLab CI builds infra/vllm:0.29.0-sm120-cu130
 ```
 
-## Launch (verified config; deviating at your own risk)
+## Launch (production config, verified 2026-09-11; deviating at your own risk)
 
 ```bash
 vllm serve /models/zai-org/GLM-5.3-Flash \
-  --served-model-name glm-5.3-flash \
+  --served-model-name GLM-5.3-Flash \
   --trust-remote-code \
   --tensor-parallel-size 4 \
-  --max-num-seqs 10 \
-  --max-model-len 524288 \
+  --enable-expert-parallel \
+  --max-model-len auto \
+  --max-num-seqs 4 \
   --max-num-batched-tokens 8192 \
-  --gpu-memory-utilization 0.95 \
+  --gpu-memory-utilization 0.97 \
   --kv-cache-dtype fp8 \
   --enable-prefix-caching \
-  --no-enable-flashinfer-autotune \
-  --enable-auto-tool-choice \
+  --enable-chunked-prefill \
   --tool-call-parser glm47 \
   --reasoning-parser glm45 \
-  --speculative-config '{"method":"mtp","num_speculative_tokens":5}'
+  --enable-auto-tool-choice \
+  --limit-mm-per-prompt '{"image": 1, "video": 0}' \
+  --default-chat-template-kwargs '{"thinking": true}'
 ```
 
-Env: `HF_HUB_OFFLINE=1`, `NCCL_P2P_LEVEL=NODE`, `VLLM_ENGINE_READY_TIMEOUT_S=3600`,
-plus JIT caps (`RAYON_NUM_THREADS`/`OMP_NUM_THREADS`, `MAX_JOBS`).
+Env: `HF_HUB_OFFLINE=1`, `NCCL_P2P_LEVEL=NODE`, `RAYON_NUM_THREADS=4`,
+`OMP_NUM_THREADS=4`, `MAX_JOBS=32`, `VLLM_FLASHINFER_AUTOTUNE_PROCESS_GROUP=1`
+(autotune stays enabled; the env syncs tactic choice across TP ranks),
+`VLLM_ENABLE_PCIE_ALLREDUCE=1` (b12x oneshot all-reduce).
 
-Notes (from the verified overlay / serve.sh):
+Notes:
 - `--block-size` is NOT set: SM120 alignment computes the 1792-token manager
   block (so the kpool storage block 448 tiles by 64). Forcing 128 reproduces
   mode 4 (`fp8_fp4_paged_mqa_logits` assert).
-- `max-num-seqs 10` pairs with 5 MTP tokens (10 x 6 = 60 <= 64 decode-batch
-  ceiling for FlashInfer's split-K decode kernel). For full 1M context use
-  `num_speculative_tokens: 1` or 0 (KV is ~8.7 KiB/token).
-- `gpu-memory-utilization 0.95`; 0.93 failed to start in the overlay's testing.
-- Verified numbers: 609,172 tokens KV (1.16x concurrency at full context),
-  MTP acceptance 29-82%.
+- `gpu-memory-utilization 0.97`: auto-fit holds the full 1M context with the
+  vision stack resident (7.91 GiB/GPU KV, 1,095,931 tokens, 1.05x concurrency;
+  measured identically on the 09-09 and 09-11 boots). The overlay-era floor
+  was 0.95; 0.93 failed to start there.
+- KV offloading is NOT carried on this branch and NOT enabled (silent cache
+  corruption under sustained agentic load; see the sm120-enablement
+  incident note).
+- MTP variant (overlay-era, not in production): `--max-num-seqs 10` pairs with
+  5 MTP tokens (10 x 6 = 60 <= 64 decode-batch ceiling for FlashInfer's
+  split-K decode kernel); for full 1M context use
+  `num_speculative_tokens: 1` or 0 (KV is ~8.7 KiB/token); MTP acceptance
+  measured 29-82% there.
+- c=1 serving profile (2026-09-11 bench): 89.0-89.7 tok/s decode on the
+  2K/8K/32K cells, 82.1 at 128K, P50 ITL 10.3-10.5 ms.
 
 ## Boot-verify checklist (REQUIRED after this rebuild)
 
