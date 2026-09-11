@@ -34,8 +34,6 @@ is retired — upstream main now carries the model plus follow-ups (#55119 EPLB,
 | Commit | What |
 |---|---|
 | FlashInfer autotune TP sync | `VLLM_FLASHINFER_AUTOTUNE_PROCESS_GROUP=1`: all-reduce measured autotune timings across the TP group so every rank picks the same tactic (diverging picks surfaced as illegal-kernel-op on the next collective) |
-| KV-offload collective barrier | `VLLM_KV_OFFLOAD_COLLECTIVE_BARRIER=1`: after `start_load_kv`, wait for this rank's CPU->GPU loads then barrier the TP group (async loads landing at different times across ranks deadlocked NCCL). Distinct from upstream's merged #52596, which fixes the shm region setup race |
-| KV-offload GPU-resident groups | groups outside the prefix-cache hash chain (GLM-5.3's kpool tail, block 4) are never offloaded — their block size cannot align to `tokens_per_hash`; they stay GPU-resident (upstream renamed the spec flag to `prefix_cacheable`) |
 | b12x PCIe oneshot allreduce | `VLLM_ENABLE_PCIE_ALLREDUCE=1`: the only custom-AR path supporting TP>2 on PCIe-only topologies (4x RTX PRO 6000 have no NVLink); installs `b12x==1.3.0` |
 | masked_mha_available=False | #54057 (still open): SM120 startup AttributeError in the prefill dispatcher |
 | SM120 kernel block size [64] | the SM120 GLM_NSA/DSv3.2 kernels are instantiated at PAGE_BLOCK_SIZE=64 only |
@@ -123,15 +121,12 @@ unverified even though the SM120 semantics ported 1:1:
 - [ ] Run with CUDA graphs + torch.compile (the production regime). Eager-only
       numbers understate decode ~5-6x on SM120 (#53963 tmttodd), so don't judge
       throughput from an eager boot.
-- [ ] Prefix-cache hit on a repeated prefix (exercises the GPU-resident
-      kpool-tail group path).
+- [ ] Prefix-cache hit on a repeated prefix (exercises the kpool-tail group
+      path).
 - [ ] Needle-style long-context retrieval at ≥100k prompt tokens (the overlay
       passes at 527k; do at least one 100k+ run).
 - [ ] Vision + tool-call smoke (multimodal processor; `glm47` parser).
 - [ ] MTP smoke (acceptance printed in logs; expect ~2.5-5 avg with 5 tokens).
-- [ ] KV offload smoke with `VLLM_KV_OFFLOAD_COLLECTIVE_BARRIER=1`
-      (`--kv-offloading-size 100 --kv-offloading-backend native`), since the
-      offloading connector/scheduler code drifted upstream.
 
 If it jams: `dump-jam-state.sh` is in the image; capture before touching anything.
 
