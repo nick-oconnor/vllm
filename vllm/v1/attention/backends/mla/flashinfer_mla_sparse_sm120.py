@@ -22,6 +22,8 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
 if TYPE_CHECKING:
     from vllm.model_executor.models.deepseek_v2 import Indexer
 
+_DS_ROPE_DIM = 64  # rope section width of the fixed 656-byte fp8_ds_mla tile
+
 
 def _kv_scale_format_for_model(model_type: str | None) -> str:
     if model_type is not None and model_type.startswith("glm"):
@@ -66,6 +68,25 @@ class FlashInferMLASparseSM120Impl(SparseMLACommonImpl[FlashInferMLASparseMetada
                 f"KV cache layout; got kv_cache_dtype={kv_cache_dtype!r}."
             )
 
+        self.kv_lora_rank: int = mla_args["kv_lora_rank"]
+        self.qk_nope_head_dim: int = mla_args["qk_nope_head_dim"]
+        self.qk_rope_head_dim: int = mla_args["qk_rope_head_dim"]
+        # NoPE models (GLM-5.3-Flash): pad into the 576-wide GLM_NSA geometry
+        # the GLM-5.2 line already uses. A zero RoPE block contributes nothing
+        # to the QK dot and the value comes from the 512 NoPE region, so this
+        # is exact; it costs 656 B/token DSA KV instead of ~528.
+        self._nope_pad = self.qk_rope_head_dim == 0
+        self.kernel_qk_rope_head_dim = self.qk_rope_head_dim
+        if self._nope_pad:
+            if self.kv_lora_rank != 512:
+                raise NotImplementedError(
+                    "FLASHINFER_MLA_SPARSE_SM120 pads NoPE MLA into the "
+                    "576-wide GLM_NSA geometry, which requires "
+                    f"kv_lora_rank=512; got {self.kv_lora_rank}."
+                )
+            self.rope_pad = _DS_ROPE_DIM
+            self.kernel_qk_rope_head_dim += self.rope_pad
+
         topk_indices_buffer = mla_args.pop("topk_indices_buffer", None)
         super().__init__(
             num_heads,
@@ -104,6 +125,32 @@ class FlashInferMLASparseSM120Impl(SparseMLACommonImpl[FlashInferMLASparseMetada
         self.supports_quant_query_input = False
         self._workspace_buffer: torch.Tensor | None = None
 
+    def do_kv_cache_update(
+        self,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        kv_cache_dtype: str,
+        k_scale: torch.Tensor,
+    ) -> None:
+        if kv_cache.numel() == 0:
+            return
+        if self._nope_pad and k_pe.size(-1) == 0:
+            # fp8_ds_mla cache tiles hardcode the DS entry shape (512-dim
+            # latent + 64-dim rope); a NoPE checkpoint writes a zero rope.
+            k_pe = k_pe.new_zeros((*k_pe.shape[:-1], self.rope_pad))
+        from vllm import _custom_ops as ops
+
+        ops.concat_and_cache_mla(
+            kv_c_normed,
+            k_pe.squeeze(1),
+            kv_cache,
+            slot_mapping.flatten(),
+            kv_cache_dtype=kv_cache_dtype,
+            scale=k_scale,
+        )
+
     def forward_mqa(
         self,
         q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
@@ -115,6 +162,9 @@ class FlashInferMLASparseSM120Impl(SparseMLACommonImpl[FlashInferMLASparseMetada
             q = torch.cat(q, dim=-1)
 
         num_actual_toks = q.shape[0]
+
+        if self._nope_pad:
+            q = torch.nn.functional.pad(q, (0, self.rope_pad))
 
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
@@ -183,21 +233,36 @@ class FlashInferMLASparseSM120Impl(SparseMLACommonImpl[FlashInferMLASparseMetada
             output = torch.cat(outputs) if len(outputs) > 1 else outputs[0]
             return output, None
 
-        topk_indices_physical = cast(
-            torch.Tensor,
+        # Pop the per-request valid top-k counts too: the SM120 kernel treats
+        # sparse_mla_top_k as page-table *capacity* and bounds each query by
+        # its own valid count (mirroring the SM100 sibling), and the dropped
+        # lowest pool leaves one padding column at the buffer's tail. Empty
+        # rows are pointed at slot 0 with length 1 and zeroed afterwards.
+        topk_indices_physical, topk_lengths = cast(
+            tuple[torch.Tensor, torch.Tensor],
             triton_convert_req_index_to_global_index(
                 attn_metadata.req_id_per_token[:num_actual_toks],
                 attn_metadata.block_table,
                 topk_indices,
                 BLOCK_SIZE=attn_metadata.block_size,
                 NUM_TOPK_TOKENS=topk_indices.shape[1],
+                return_valid_counts=True,
             ),
         )
+        # Empty rows (zero valid top-k) point at slot 0 with length 1 and are
+        # zeroed after the kernel; the SM120 kernel requires length >= 1.
+        empty_rows = topk_lengths == 0
+        topk_indices_physical[:, 0] = topk_indices_physical[:, 0].masked_fill(
+            empty_rows, 0
+        )
+        topk_lengths = topk_lengths.clamp(min=1)
         return (
             self._run_mqa_kernel(
                 q,
                 kv_c_and_k_pe_cache,
                 topk_indices_physical,
+                topk_lengths=topk_lengths,
+                empty_rows=empty_rows,
             ),
             None,
         )
@@ -207,6 +272,8 @@ class FlashInferMLASparseSM120Impl(SparseMLACommonImpl[FlashInferMLASparseMetada
         q: torch.Tensor,
         kv_cache: torch.Tensor,
         topk_indices_physical: torch.Tensor,
+        topk_lengths: torch.Tensor | None = None,
+        empty_rows: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_actual_toks = q.shape[0]
 
@@ -229,9 +296,9 @@ class FlashInferMLASparseSM120Impl(SparseMLACommonImpl[FlashInferMLASparseMetada
             workspace_buffer=self._workspace_buffer,
             qk_nope_head_dim=self.qk_nope_head_dim,
             kv_lora_rank=self.kv_lora_rank,
-            qk_rope_head_dim=self.qk_rope_head_dim,
+            qk_rope_head_dim=self.kernel_qk_rope_head_dim,
             block_tables=topk_indices_physical.unsqueeze(1),
-            seq_lens=None,
+            seq_lens=topk_lengths,
             max_seq_len=sparse_capacity,
             out=output.unsqueeze(1),
             bmm1_scale=self.scale,
@@ -239,4 +306,7 @@ class FlashInferMLASparseSM120Impl(SparseMLACommonImpl[FlashInferMLASparseMetada
             sparse_mla_top_k=sparse_capacity,
             kv_scale_format=self.kv_scale_format,
         )
-        return out.squeeze(1)
+        out = out.squeeze(1)
+        if empty_rows is not None:
+            out.masked_fill_(empty_rows.view(-1, 1, 1), 0.0)
+        return out
