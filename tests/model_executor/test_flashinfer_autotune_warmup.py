@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+import re
 import sys
 from collections import defaultdict
 from contextlib import nullcontext
@@ -15,6 +16,7 @@ import pytest
 
 from vllm.model_executor.warmup import kernel_warmup as warmup
 from vllm.model_executor.warmup.kernel_warmup import (
+    _all_ranks_have_file,
     _flashinfer_autotune_token_counts,
     _run_flashinfer_autotune_dummy_runs,
     flashinfer_autotune,
@@ -162,6 +164,7 @@ class _AutotuneTuner:
         self.run = run
         self.cache = {}
         self.loaded = None
+        self._dirty = False
 
     def load_configs(self, path):
         self.loaded = json.loads(Path(path).read_text())
@@ -182,6 +185,7 @@ class _AutotuneTuner:
             if group is not None:
                 group.record(("all_reduce", operation, tactic))
         self.cache[operation] = self.run.rank // self.run.tp
+        self._dirty = True
 
 
 class _AutotuneRun:
@@ -259,6 +263,14 @@ def autotune_run(monkeypatch, tmp_path):
         monkeypatch.setattr(
             warmup, "_flashinfer_autotune_skip_ops", lambda runner: None
         )
+
+        def all_ranks_have_file(path, group):
+            return all(
+                Path(re.sub(r"_rank\d+(?=\.)", f"_rank{peer}", str(path))).exists()
+                for peer in range(group.world_size)
+            )
+
+        monkeypatch.setattr(warmup, "_all_ranks_have_file", all_ranks_have_file)
         monkeypatch.setattr(
             warmup, "_run_flashinfer_autotune_dummy_runs", run.dummy_runs
         )
@@ -286,19 +298,27 @@ def test_pp_stage_cache_roundtrip_isolated_and_asymmetric_hits_safe(
     legacy = tmp_path / "autotune_configs.json"
     legacy.write_text('{"legacy_world_cache": 99}')
     cold = autotune_run().execute()
-    assert [rank for rank, _, _ in cold.saves] == [0, 4]
+    # Every rank persists its own file: FlashInfer keys MoE entries by tp/ep
+    # rank, so the leader's file would only ever hit on the leader.
+    assert [rank for rank, _, _ in cold.saves] == list(range(8))
     paths = [path for _, path, _ in cold.saves]
-    assert len(set(paths)) == 2 and legacy not in paths
+    assert len(set(paths)) == 8 and legacy not in paths
     assert json.loads(legacy.read_text()) == {"legacy_world_cache": 99}
-    assert cold.saves[0][2] == {"shared_gemm": 0, "pp0_extra_gemm": 0}
-    assert cold.saves[1][2] == {"shared_gemm": 1}
+    for rank, _, cache in cold.saves:
+        stage = rank // 4
+        assert cache == (
+            {"shared_gemm": 0, "pp0_extra_gemm": 0} if stage == 0 else {"shared_gemm": 1}
+        )
     cold.assert_collectives_match()
     warm = autotune_run().execute()
     warm.assert_collectives_match()
     assert not warm.profile_groups
+    assert not warm.saves  # nothing tuned, so the dirty-gated save is skipped
     for rank, tuner in warm.tuners.items():
-        assert tuner.loaded == cold.saves[rank // 4][2]
-    paths[1].unlink()
+        assert tuner.loaded == cold.saves[rank][2]
+    # Losing any single rank's file makes that whole tuning group re-profile,
+    # which is the point: a group must never split into hitters and missers.
+    paths[5].unlink()
     mixed = autotune_run().execute()
     mixed.assert_collectives_match()
     assert set(mixed.profile_groups) == {4, 5, 6, 7}
@@ -306,10 +326,31 @@ def test_pp_stage_cache_roundtrip_isolated_and_asymmetric_hits_safe(
     assert all(mixed.tuners[rank].loaded is None for rank in range(4, 8))
 
 
-def test_pp1_retains_world_synchronization_and_existing_cache_name(autotune_run):
+def test_pp1_retains_world_synchronization_with_per_rank_cache_names(autotune_run):
     run = autotune_run(pp=1, tp=4).execute()
     run.assert_collectives_match()
     assert [(rank, path.name) for rank, path, _ in run.saves] == [
-        (0, "autotune_configs.json")
+        (rank, f"autotune_configs_dp0_rank{rank}.json") for rank in range(4)
     ]
     assert all(groups == [(0, 1, 2, 3)] for groups in run.profile_groups.values())
+
+
+@pytest.mark.parametrize(
+    ("world_size", "gathered", "expected"),
+    [(1, None, True), (2, [True, True], True), (2, [True, False], False)],
+)
+def test_all_ranks_have_file_requires_every_rank(
+    tmp_path, world_size, gathered, expected
+):
+    path = tmp_path / "autotune_configs_dp0_rank0.json"
+    path.touch()
+    world = SimpleNamespace(world_size=world_size, cpu_group=object())
+
+    def fake_all_gather_object(out, obj, group):
+        assert obj is True and group is world.cpu_group
+        out[:] = gathered
+
+    with patch(
+        "torch.distributed.all_gather_object", side_effect=fake_all_gather_object
+    ):
+        assert _all_ranks_have_file(path, world) is expected
