@@ -673,8 +673,8 @@ RUN --mount=type=cache,target=/opt/uv/cache \
             requirements/cuda.txt; \
     fi
 
-# ocnr: override the build version so the wheel reports 0.29.0+sm120.cu130
-ARG VLLM_VERSION_OVERRIDE=0.29.0+sm120.cu130
+# ocnr: override the build version so the wheel reports 0.30.0+sm120.cu130
+ARG VLLM_VERSION_OVERRIDE=0.30.0+sm120.cu130
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=${VLLM_VERSION_OVERRIDE}
 
 # Build the vLLM wheel (no .git bind mount; version is set via VLLM_VERSION_OVERRIDE)
