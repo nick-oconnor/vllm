@@ -1326,6 +1326,16 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         rm -f /tmp/kv-installed.txt /tmp/kv-constraints.txt; \
     fi
 
+# b12x: SM12x CuTe-DSL kernels. Provides the PCIe oneshot all-reduce runtime
+# (b12x.comm.pcie) used by CustomAllreduce when VLLM_ENABLE_PCIE_ALLREDUCE=1.
+# Installed with --no-deps: b12x still pins cutlass-dsl==4.6.2, but upstream
+# vllm (since the DSL 4.7 bump) requires cutlass-dsl 4.7.1 at runtime. Letting
+# uv resolve b12x's deps downgrades cutlass-dsl and engine init crashes with
+# "No module named 'cutlass.base_dsl.enums'". Everything else b12x needs
+# (torch>=2.12, tvm-ffi, cuda-python, rich, transformers, safetensors) is
+# already provided by the vllm-base stage.
+RUN uv pip install --system --no-deps "b12x==1.3.0"
+
 # Mooncake registers GPU memory for RDMA via nvidia-peermem by default. Hosts
 # without that module loaded (e.g. GB200) must pass WITH_NVIDIA_PEERMEM=0 at run
 # time; see docs/features/mooncake_connector_usage.md. Deliberately not an ENV
