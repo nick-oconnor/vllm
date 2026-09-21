@@ -25,6 +25,7 @@ build:
   variables:
     DOCKER_HOST: tcp://docker:2375
     DOCKER_TLS_CERTDIR: ""
+    BUILDX_NO_DEFAULT_OCI_ARTIFACT: "true"
   timeout: 6 hours
   before_script:
   - |
