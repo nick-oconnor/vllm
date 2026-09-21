@@ -1,0 +1,12 @@
+{
+  "$schema": "https://docs.renovatebot.com",
+  "extends": [
+    "config:best-practices"
+  ],
+  "gitAuthor": "Renovate Bot <renovate@ocnr.org>",
+  "description": "Nothing watched - the SM120 pins in requirements/ and docker/ are deliberate and must not be automerged; do not widen includePaths",
+  "includePaths": [],
+  "automerge": true,
+  "automergeType": "branch",
+  "ignoreTests": true
+}
