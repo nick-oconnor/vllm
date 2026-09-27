@@ -17,6 +17,8 @@ from vllm.utils.flashinfer import has_flashinfer
 from vllm.v1.worker.gpu.warmup import run_mixed_prefill_decode_warmup
 
 if TYPE_CHECKING:
+    from flashinfer.autotuner import AutoTuner
+
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner as V2GPUModelRunner
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
     from vllm.v1.worker.gpu_worker import Worker
@@ -116,6 +118,40 @@ def _uses_v2_model_runner(runner: "GPUModelRunner") -> bool:
     return bool(getattr(vllm_config, "use_v2_model_runner", False))
 
 
+def _drop_leader_only_tuning(tuner: "AutoTuner") -> None:
+    """Return every rank's AutoTuner to a pristine state after the leader tune.
+
+    The autotune above runs on rank 0 only, and because the dummy run drives
+    the whole model it tunes far more than the sparse-MLA decode kernels it is
+    meant to prime -- on an NVFP4 checkpoint it also tunes the linear and MoE
+    GEMMs. Leaving that state in place deadlocks the synchronized autotune
+    that runs next in ``kernel_warmup.flashinfer_autotune``: a rank that hits
+    the cache skips ``choose_one``'s per-tactic all-reduce while the ranks that
+    miss block in it forever, with no symptom beyond EngineCore repeating
+    "No available shared memory broadcast block".
+
+    Broadcasting the leader's cache file does not equalise the ranks, for two
+    independent reasons:
+
+    * ``AutoTuner.search_cache`` consults the live in-process
+      ``profiling_cache`` *before* file configs, so the leader keeps hitting
+      its own live entries whether or not the file round-trips them.
+    * FlashInfer keys MoE entries by tp/ep rank
+      (``MoERunner.get_cache_key_extras``), so the leader's entries only ever
+      match on the leader even when every rank loads the identical file.
+
+    Both were observed here: clearing only the live cache moved the hang from
+    ``mm_fp4`` to ``cutlass_fused_moe`` rather than fixing it.
+
+    So drop the leader's tuning entirely and let the synchronized pass re-tune,
+    where all ranks participate and each keys its own entries. The cost is the
+    sparse-MLA decode shapes that only this mixed-batch warmup produces: those
+    fall back to FlashInfer's tactic heuristic, which is the same outcome this
+    function's caller already accepts when no cache entries are produced.
+    """
+    tuner.clear_cache()
+
+
 def _run_flashinfer_sparse_mla_decode_autotune(
     worker: "Worker",
     num_tokens: int,
@@ -205,20 +241,23 @@ def _run_flashinfer_sparse_mla_decode_autotune(
             "Falling back to FlashInfer's default tactic heuristic.",
             log_label,
         )
+        # The leader may still hold live entries even with nothing saved.
+        _drop_leader_only_tuning(AutoTuner.get())
         world.barrier()
         return True
 
     write_flashinfer_autotune_cache(cache_path, tune_results)
     world.barrier()
 
-    AutoTuner.get().load_configs(str(cache_path))
-    logger.info(
-        "FlashInfer SM120 sparse MLA %s decode autotune cache loaded on rank %d "
-        "from %s.",
-        log_label,
-        world.rank_in_group,
-        cache_path,
-    )
+    _drop_leader_only_tuning(AutoTuner.get())
+    if is_leader:
+        logger.info(
+            "FlashInfer SM120 sparse MLA %s decode autotune cache written to %s; "
+            "in-process tactics dropped so the synchronized autotune stays in "
+            "step across ranks.",
+            log_label,
+            cache_path,
+        )
     return True
 
 
