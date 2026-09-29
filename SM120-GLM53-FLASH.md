@@ -1,0 +1,343 @@
+# GLM-5.3-Flash on SM120 (ocnr "0.31" branch)
+
+Serve `zai-org/GLM-5.3-Flash` (320B/18B-active multimodal MoE, hybrid KDA
+linear-attention + rope-free sparse MLA, mHC, MTP) on the ocnr SM120 box
+(4x RTX PRO 6000 Blackwell Max-Q, SM120, 96 GB each).
+
+**Base: upstream `vllm-project/vllm` main, past the v0.31.0 fork
+(rebased 2026-10-05, base `2b32d9ac6a`).** The branch was first cut on the
+`v0.31.0` tag and then moved to main, which drops two carries and closes a
+gap (see below). Note `v0.31.0` is *not* an ancestor of main — the release
+branch carries its own cherry-picks, so presence of a fix must be checked by
+PR number, never by commit SHA. Previous 0.30 re-cuts: 2026-09-27
+`924707f1bf`, 09-23 `9f07d023d0`, 09-22 `d90f0eade5`, 09-18/09-20
+`4868312128`. GLM-5.3-Flash model support merged upstream
+as #53906 (2026-09-03, after the v0.29.0 release branch forked, so the
+v0.29.0 release tag does NOT contain it). The previous ocnr 0.29 branch
+carried the ZJY0516/vllm `glm-release` fork for model support; that fork
+is retired — upstream main now carries the model plus follow-ups (#55119 EPLB,
+#55214 packaging). The branch is upstream main + the ocnr commits listed below.
+
+## Why fp8 + FLASHINFER_MLA_SPARSE_SM120 (not the d512/bfloat16 lane)
+
+- On SM120 the sparse-MLA decoder kernel only takes the packed **`fp8_ds_mla`**
+  KV layout; **bf16 KV has no kernel on this arch** (#53963). So `--kv-cache-dtype
+  fp8` is mandatory.
+- The checkpoint is NoPE (`qk_rope_head_dim=0`, 512-wide query) but every SM120
+  kernel is the 576-wide GLM_NSA/DSv3.2 geometry (or DSv4 512, which carries
+  448/64 and topk<=1024). We keep `FLASHINFER_MLA_SPARSE_SM120` and **zero-pad
+  the latent 512 -> 576** (exact: a zero RoPE adds nothing to QK; the value comes
+  from the 512 NoPE region; ~656 B/token DSA KV instead of ~528).
+- The experimental `D512_SM120` bf16 fallback lane (vendored d512 kernels from
+  jasl/vllm #41834) was **dropped** in this rebuild: it was never end-to-end
+  verified, is not reachable from the production config (fp8 is mandatory on
+  SM120), and the upstream PR is still open — re-vendor it from the
+  `jasl/ds4-sm120` fork (the #41834 source) if a bf16 lane is ever needed.
+
+## What the branch changes (vs upstream main)
+
+`git log --oneline upstream/main..0.31`
+
+| Commit | What |
+|---|---|
+| **#55601 carry** | seed the hybrid mamba state index with `mamba_block_size`; fixes issue #55600, still open upstream (approved 2026-09-27) |
+| **#57635 carry (both commits, one commit)** | per-rank FlashInfer autotune cache (`autotune_configs_dp{dp}_rank{r}.json` + dirty-flag save): FlashInfer keys MoE entries by tp/ep rank, so the rank-0-only cache file + broadcast made only rank 0's lookups hit and deadlocked the EP ranks on any second boot with a persistent cache root; lets `VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS` be dropped from the deploy manifest after boot-verify |
+| ocnr scheduler aligned-split fix | `_mamba_block_aligned_split` derives cacheable positions and chunk ends from the resolved LCM alignment (`self.block_size`) instead of `cache_config.block_size` (the smallest group block); reported against #55600, no upstream PR yet |
+| b12x PCIe oneshot allreduce | `VLLM_ENABLE_PCIE_ALLREDUCE=1`: the only custom-AR path supporting TP>2 on PCIe-only topologies (4x RTX PRO 6000 have no NVLink); installs `b12x==1.3.0` |
+| SM120 kernel block size [64] | the SM120 GLM_NSA/DSv3.2 kernels are instantiated at PAGE_BLOCK_SIZE=64 only |
+| NoPE backend priority | for NoPE+sparse models on major==12, FLASHINFER_MLA_SPARSE_SM120 is tried before TRITON_MLA (upstream's default order is TRITON_MLA first; rope-64 DeepSeek-shaped models keep the default) |
+| **NoPE on FLASHINFER_MLA_SPARSE_SM120** | zero-pad q and k_pe into the 576 geometry (`do_kv_cache_update` + `forward_mqa`); `return_valid_counts` + `seq_lens=valid counts` + empty-row handling; kpool indexer drops the lowest-ranked pool on family-120 and glm5next model/mtp pin the buffer width to `index_topk` (the fp8_ds_mla trtllm-gen kernel is instantiated for exactly 2048). The SM100 native-nope lane (nope_mla_dimensions, generic topk) is untouched |
+| SM120 leader-only warmup autotune dropped | the rank-0 sparse-MLA decode autotune + cache-file broadcast could not equalise the ranks (the in-process profiling cache is consulted before file configs, and FlashInfer keys MoE entries by tp/ep rank), deadlocking the synchronized pass — every rank now tunes in the synchronized pass instead, which also drops the `VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS` workaround |
+| SM120 build config | VERSION 0.31.0+sm120.cu130, GitLab CI, Dockerfile (arch 12.0, DeepEP 12.0a + NCCL LIBRARY_PATH fix, MAX_JOBS=32/NVCC_THREADS=1, g++ + cuda-nvrtc-dev for runtime JIT, py-spy + dump-jam-state.sh) |
+
+### 2026-10-05 cut onto upstream main (via v0.31.0)
+
+Cut on the `v0.31.0` tag first, then rebased onto main (`2b32d9ac6a`). Moving to
+main changed the carry set:
+
+- **#55222 dropped** — merged upstream as `c37f86e572`, after the 0.31 fork.
+  Both halves verified present on main (model-side `// index_kpool` and the
+  chunker budget in compressed rows) before the carry was skipped.
+- **#56531 dropped** — merged upstream; git auto-dropped it as "patch
+  contents already upstream". It had been carried on the tag base because the
+  tag predates the merge. Without it a decode row carrying zero drafts is
+  demoted off the speculative path and never applies the previous step's
+  accepted offset, so the KDA recurrent state drifts with decode volume —
+  the shape of the long-session degeneration reports (#56868), and we run
+  MTP k=3 where zero-draft decode rows are routine.
+- **#59504 now included** — exempt exactly the blocks an async KV load writes
+  from zeroing. On the tag base this was a known, uncarried gap (it needs a
+  `_set_kv_fetch_stage` state machine the tag lacks). It touches the offload
+  load path we use, so moving to main closes it.
+
+Still required, none upstream: #55601, #57635, the scheduler aligned-split
+fix, b12x, the NoPE port, the leader-only warmup fix. #57477 (kpool tail seed
+stride) remains uncarried — upstream since before 0.31.
+
+**#57635 had to be adapted, not replayed.** Upstream restructured
+`flashinfer_autotune` for PP: with PP > 1 each stage's TP group now tunes
+separately with its own `_tp_<ranks>` cache file. That restructure is scoping
+only — the leader-reads-and-broadcasts pattern the carry removes is still
+there on main, so the carry is still needed. It now scopes per rank *within*
+the tuning group (`_dp{dp}_rank{rank_in_group}`, layered on the PP
+suffix), gathers over `tune_group` rather than the world group, and barriers
+on `tune_group`. Upstream's accompanying tests assert the old leader-only
+save, so they were updated to per-rank semantics; the sequential test harness
+cannot model an all-gather, so it stubs `_all_ranks_have_file` by checking
+each rank's deterministic path, and the helper keeps its own unit test.
+**Those tests have not been executed** — pytest is not in the runtime image.
+
+Measured on the box at the *tag* base (TP4+EP, NVFP4, MTP k=3, offload on,
+gmu 0.66) before the move to main:
+
+| | 0.30 @ gmu 0.69 | 0.31 @ gmu 0.66 |
+|---|---|---|
+| weights / GPU | 49.17 GiB | 49.17 GiB |
+| consumed (weights + non-torch) | 50.68 GiB | 50.73 GiB |
+| CUDA-graph reserve (est / actual) | 4.19 / 0.07 GiB | **0.95 / 0.18 GiB** |
+| available KV | 8.50 GiB | **9.17 GiB** |
+| auto-fit | full 1,048,576 (1.01x) | full 1,048,576 (**1.10x**) |
+
+The CUDA-graph over-reservation that cost ~4 GiB of KV on 0.30 is gone, so
+0.31 holds the full 1M with more concurrency at a *lower* gmu.
+
+**Long-context poisoning check** (tag base; the failure this branch exists to
+avoid — silent KV/state corruption surfacing as degraded reasoning and
+looping):
+
+- 1,005,745-token needle: found cold (137.7 s) and on the prefix-cache hit
+  (2.4 s), identical answers
+- eviction/offload: five distinct 502,902-token sessions filled and then
+  revisited after the 1.15M-token pool had fully turned over — 10/10 correct,
+  2,499,840 external (CPU offload) prefix-cache hit tokens, 0 preemptions
+- accumulated decode over a 122K-token session: answers stayed specific and
+  coherent, max 6-gram repeat 0-1
+- engine totals: 37 requests, `finished_reason="repetition"` **0**, `error` 0,
+  `abort` 0, MTP acceptance 73.3%
+
+Caveats: that is ~40 minutes of synthetic load, while the community reports
+(#56868, #56605) describe degeneration after much longer real agentic
+traffic — evidence at this scale, not proof. And it was measured on the tag
+base; main is ~417 commits further on, so it needs re-running after a rebuild.
+
+Notes on pieces deliberately NOT carried over from the old branch:
+
+- **kpool tail-slot persistence fix**: upstream via #53906 (verified identical
+  code on main; the fork's PR #7 was the same fix).
+- **SM120 page-alignment fix** (`_get_indexer_block_alignment` family-120 →
+  pool page 64): already upstream, equivalent implementation.
+- **C128A topk metadata JIT-recompile fix** (do_not_specialize + warmup in
+  `deepseek_v4/sparse_mla.py`): DSv4-only — glm5next does not touch
+  `deepseek_v4/`, and this box serves GLM-5.3-Flash exclusively. Upstream's
+  #53574 (merged in v0.29.0) fixed the SM120 C128A decode-view contiguity
+  half. Restore from the backup branch if DSv4 returns to this box.
+- **FlashInfer 0.6.17 pin**: obsolete — upstream main has moved on twice
+  since (0.6.18.post1 at the 09-23 re-cut, **0.7.0 since #58069**, in this
+  branch's base); main's pin is used.
+- **FlashInfer autotune TP sync** (`VLLM_FLASHINFER_AUTOTUNE_PROCESS_GROUP`):
+  dropped 2026-09-22 — upstream now syncs autotune tactics natively: the
+  generic warmup sets the autotune process group to the world group and
+  broadcasts the leader's cached results (`kernel_warmup.py`). The SM120
+  sparse-MLA decode warmup originally ran leader-only autotune plus a
+  cache-file broadcast; that leader path is dropped on this branch
+  (2026-09-27) — broadcasting cannot equalise the ranks, so every rank
+  re-tunes in the synchronized pass instead (see the commit table). The
+  residual ocnr value was only guarding lazy runtime re-tuning of shapes the
+  warmup did not cover; if a diverging-tactic illegal-kernel-op ever
+  reappears mid-session, restore the commit from the pre-rebase 0.30 history.
+
+## Build
+
+```bash
+git switch main
+git push origin main   # GitLab CI builds infra/vllm:0.31.0-sm120-cu130 (the build is gated to the default branch: push main, not a snapshot branch)
+```
+
+## Launch (production config, verified 2026-09-11; deviating at your own risk)
+
+```bash
+vllm serve /models/zai-org/GLM-5.3-Flash \
+  --served-model-name GLM-5.3-Flash \
+  --trust-remote-code \
+  --tensor-parallel-size 4 \
+  --enable-expert-parallel \
+  --max-model-len auto \
+  --max-num-seqs 4 \
+  --max-num-batched-tokens 8192 \
+  --gpu-memory-utilization 0.97 \
+  --kv-cache-dtype fp8 \
+  --enable-prefix-caching \
+  --kv-offloading-size 100 \
+  --kv-offloading-backend native \
+  --enable-chunked-prefill \
+  --tool-call-parser glm47 \
+  --reasoning-parser glm45 \
+  --enable-auto-tool-choice \
+  --limit-mm-per-prompt '{"image": 1, "video": 0}' \
+  --default-chat-template-kwargs '{"thinking": true}'
+```
+
+Env: `HF_HUB_OFFLINE=1`, `NCCL_P2P_LEVEL=NODE`, `RAYON_NUM_THREADS=4`,
+`OMP_NUM_THREADS=4`, `MAX_JOBS=32`, `VLLM_ENABLE_PCIE_ALLREDUCE=1` (b12x
+oneshot all-reduce). FlashInfer autotune stays enabled; tactic consistency
+across TP ranks is upstream-native now (the generic warmup broadcasts the
+leader's cached results; the SM120 sparse-MLA decode warmup tunes on every
+rank — the leader-only shortcut is dropped).
+
+Notes:
+- `--block-size` is NOT set: SM120 alignment computes the 1792-token manager
+  block (so the kpool storage block 448 tiles by 64). Forcing 128 reproduces
+  mode 4 (`fp8_fp4_paged_mqa_logits` assert).
+- `gpu-memory-utilization 0.97`: auto-fit holds the full 1M context with the
+  vision stack resident (7.68 GiB/GPU KV, 1,064,361 tokens, 1.02x
+  concurrency, 2026-09-20 boot on the upstream-main re-cut; 7.91 GiB /
+  1,095,931 tokens on the 09-09/09-11/09-17 pre-0.30 boots). The overlay-era
+  floor was 0.95; 0.93 failed to start there.
+- KV offloading IS enabled in production (`--kv-offloading-backend native`,
+  `--kv-offloading-size 100`): upstream's native `CPUOffloadingSpec` mmaps a
+  100 GiB pool in `/dev/shm` (`vllm_offload_*.mmap`) — the pod's dshm must
+  be **120Gi**. Upstream scopes offload configs to prefix-cacheable groups
+  itself (`get_offloading_group_ids` → `prefix_cacheable_group_ids`), so
+  the kpool-tail scratch group is excluded and the old #54743 carry is not
+  needed on this branch. **0.30 context regression — root-caused and fixed
+  (2026-09-20):** the 09-18 boot profiled only **3.81 GiB** for KV and
+  auto-fit cut max_model_len to **516,096**. The cause was *not* the
+  CUDAGraph reserve: the indexer prefill gather workspace
+  (`Indexer.max_total_seq_len = get_max_prefill_buffer_size()`) is sized in
+  **tokens** while this indexer's KV is **pool-granular**
+  (`compress_ratio == index_kpool == 4`), so it reserved
+  `max_model_len * 40 * 132 B` = **5.16 GiB/GPU** instead of 1.29 GiB.
+  Upstream PR **#55222** (issue #55221) divides by `index_kpool` at that call
+  site, exactly as `deepseek_v4/attention.py` already did; both halves of the
+  PR are carried on this branch (the call-site fix plus the chunker budget
+  sized in compressed rows, which otherwise admits up to `compress_ratio`x
+  more rows than the workspace holds at ≥64 requests near max-model-len).
+  Measured effect: consumed memory 82.27 → **78.40 GiB/GPU**,
+  available KV 3.81 → **7.68 GiB**, `Auto-fit max_model_len: full model
+  context length 1048576 fits`. Verified by A/B: booting the *unfixed* image
+  at `--max-model-len 262144` (which scales the same workspace by 1/4)
+  reproduced consumed 78.4 GiB / KV 7.77 GiB. Ignore the
+  `CUDA graph pool memory: 0.07 GiB (actual), 4.19 GiB (estimated)` line —
+  the estimator's profiling capture is the first forward with a KV cache, so
+  it charges the one-time persistent workspace allocations to CUDA graphs;
+  the reserve is real memory and **must not** be disabled with
+  `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0` (that double-spends it and
+  OOMs). The 2026-09-10 corruption was NOT caused by offloading — root cause
+  #55600 (state-seed units on any prefix-cache hit), fixed by #55601
+  (carried here); see the sm120-enablement incident note.
+- MTP variant (overlay-era, not in production): `--max-num-seqs 10` pairs with
+  5 MTP tokens (10 x 6 = 60 <= 64 decode-batch ceiling for FlashInfer's
+  split-K decode kernel); for full 1M context use
+  `num_speculative_tokens: 1` or 0 (KV is ~8.7 KiB/token); MTP acceptance
+  measured 29-82% there.
+- c=1 serving profile (2026-09-11 bench): 89.0-89.7 tok/s decode on the
+  2K/8K/32K cells, 82.1 at 128K, P50 ITL 10.3-10.5 ms.
+
+## Silent KV-cache poisoning: the kpool tail seed kernel (fixed 2026-09-20)
+
+`get_kv_cache_config_from_groups` aliases each layer's **tail** tensor onto
+its **indexer** tensor at the same offset, so the tail view carries the
+indexer's block stride. Measured on this box (probe print at first prefill):
+`shape=(N, 2, 4, 128) stride=(38016, 512, 128, 1)` — `stride(0)` is 38016
+elements, not the dense `2 * kpool * head_dim = 1024`.
+
+The NVIDIA `_kpool_tail_seed_kernel` addressed blocks densely
+(`base = (blk * 2 * KPOOL + t % KPOOL) * HEAD_DIM`). For every tail block
+`blk > 0` that means the seed write lands **inside an unrelated indexer
+block** (`blk * 1024` falls in indexer block `blk // 37`), overwriting pooled
+indexer keys with raw K / gate-score values, while the request's own tail
+block is never seeded and is read back as stale bytes. It fires on every
+prefill, is silent (writes stay inside the shared allocation, so no OOB and
+no crash), and the damage is persistent and prefix-cached — which is why the
+symptom is progressive degeneration over a long session that only a restart
+clears. The AMD kernel never had the bug.
+
+Fixed upstream by **#57477** (`TAIL_BLOCK_ELEMS` / `KPOOL_HEAD` from
+`tail.stride(0)` / `tail.stride(1)`), in this branch's base since the
+2026-09-20 re-cut. Regression test:
+`tests/kernels/test_kpool_decode_update_batched.py::test_prefill_seed_honors_padded_tail_block_stride`
+(runs on every platform) — it FAILS on the 09-18 image and PASSES here.
+
+## Boot-verify checklist (REQUIRED after this rebuild)
+
+The 2026-09-27 rebase (base `924707f1bf`, past v0.30.0) carries the same
+SM120 semantics plus the new carries (#55222 squashed to one commit,
+#55601, #57635 per-rank autotune cache, the ocnr scheduler aligned-split
+fix), but upstream moved ~202 commits underneath — including the
+FlashInfer **0.7.0** bump (#58069), GLM-5.3-Flash corruption fixes from
+the #56868/#56605 hunt (#58454 kpool pool-selection corruption with
+speculative decoding, #58368 prompt-tail prefix-cache hits with MTP),
+the profiling-fragmentation fix (#58430), the GLM5.3 metadata-op
+optimization (#58450), #58061 (dense MLP on the sequence-parallel shard),
+#55442 (deferred disposable MTP head) and the #55277 merge. Treat the
+first boot as unverified:
+
+- [ ] `Engine: ready`; confirm the log selects FLASHINFER_MLA_SPARSE_SM120
+      (N.B. the module-name report may show `TRITON_MLA` first in the list but
+      FlashInfer wins for fp8+sparse; the fp8_ds_mla / GLM_NSA kernel is the
+      one actually used).
+- [ ] No `pe_dim must be 64 for fp8_ds_mla` / DeepGEMM `block_kv==64` asserts
+      on first decode, and no shape/stride assert from the trtllm-gen kernel
+      (flashinfer 0.7.0 changed kernels vs the verified 0.6.18.post1 — if the
+      SM120 fp8_ds_mla path broke, pin `flashinfer-python==0.6.18.post1` +
+      `flashinfer-jit-cache==0.6.18.post1` (or 0.6.17) in requirements/cuda.txt
+      and docker/versions.json as the old branch did).
+- [ ] Greedy temp-0 sanity: use a **wide-margin prompt** (e.g. an exact-copy
+      needle or arithmetic Q) and compare across modes (eager vs CUDA graphs vs
+      MTP) — NOT two separate runs: MoE+TP4 temp-0 is not bit-reproducible
+      across runs on open-ended prompts (soft argmax ties resolved by TP
+      reduction noise; #53963 determinism note). Wide-margin prompts are
+      bit-identical across modes.
+- [ ] Run with CUDA graphs + torch.compile (the production regime). Eager-only
+      numbers understate decode ~5-6x on SM120 (#53963 tmttodd), so don't judge
+      throughput from an eager boot.
+- [ ] Prefix-cache hit on a repeated prefix (exercises the kpool-tail group
+      path).
+- [ ] Needle-style long-context retrieval at ≥100k prompt tokens (the overlay
+      passes at 527k; do at least one 100k+ run).
+- [ ] Vision + tool-call smoke (multimodal processor; `glm47` parser).
+- [ ] MTP smoke (acceptance printed in logs; expect ~2.5-5 avg with 5 tokens).
+- [ ] Restart once and confirm the **second** boot completes the FlashInfer
+      autotune warmup (the #57635 carry writes per-rank cache files under the
+      persistent cache root; before it, a rank-0-only file deadlocked ranks
+      1-3 at the tuning reduce — the symptom was rank 0 done, ranks 1-3 at 0%
+      with repeated `shm_broadcast` "No available shared memory broadcast
+      block").
+
+If it jams: `dump-jam-state.sh` is in the image; capture before touching anything.
+
+## Caveats learned upstream (don't chase these as branch bugs)
+
+- **Checkpoint choice matters** (#54150): ModelOpt NVFP4 conversions emit
+  invalid UTF-8 tokens; `RedHatAI/GLM-5.3-Flash-NVFP4` (compressed-tensors) is
+  clean. NVFP4 MoE on SM120 only served correctly by `marlin` and only with it
+  passed explicitly (`--moe-backend marlin`; `auto`/others spin or collapse to
+  single-token loops - #53963/@53906 field reports). Marlin repack can OOM at
+  TP=2 (fixed by host-staged repack; relevant only if you go NVFP4 at <TP4).
+  The staged native-FP8 checkpoint uses the fp8 path above, so these matter
+  only if you switch to NVFP4.
+- **Stay at TP4 for this box.** A TP=2 report on the same overlay hung in the
+  MHC prenorm GEMM (both DeepGEMM and TileLang) at small warmup batches /
+  32-heads-per-rank geometry - every verified config here is TP4 (16
+  heads/rank), which doesn't hit it (#53963).
+- FlashInfer's natively rope-free SM120 path would replace the 512->576
+  zero-pad. **Decision (2026-08-28, re-checked 2026-09-23): still don't
+  switch.** The kernel side is ready — flashinfer #4802 (refactor) and
+  #5075 (runtime KV row stride + canonical 528B GLM53_NOPE rows + NaN-safe
+  masked gathers) are merged, and a field report on RTX PRO 6000 confirms
+  GLM-5.3-Flash serving with #5075 + a temporary NoPE KV-cache writer
+  (#53963, 2026-09-18). vLLM-side writer support landed: **#55277 merged
+  2026-09-23** (native `pe_dim=0` rows in `fp8_ds_mla` `concat_and_cache`,
+  in this branch's base since the 2026-09-23 re-cut). The remaining blocker
+  is #53969's width check, which rejects every faithful checkpoint — all
+  released conversions carry `index_topk=2048` -> effective 2176, only
+  `--hf-overrides '{"text_config":{"index_topk":2044}}'` gets past it
+  (#53969 omid-a, 2026-09-18). Revisit once that lifts; expect ~24% DSA-KV
+  capacity win (528 vs 656 B/token).
+- Upstream merged b12x **MoE/GEMM kernels** for SM12x (`--kernel-backend
+  b12x` / `flashinfer_b12x`, FP4 + FP8 linear/MoE) — name-share with our
+  PCIe allreduce patch, but the upstream kernels are self-contained (no
+  b12x pip import), so the `--no-deps` install is unaffected. Relevant only
+  if you revisit NVFP4 (currently marlin-only per above).
+- Upstream main moves fast; rebase this branch per release and re-run the
+  boot-verify checklist each time.
