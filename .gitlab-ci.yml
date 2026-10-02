@@ -21,38 +21,35 @@ renovate:
   - if: $CI_PIPELINE_SOURCE == 'schedule'
 build:
   stage: build
-  image: ${CI_REGISTRY}/infra/docker:latest
+  image: moby/buildkit:rootless
   variables:
-    DOCKER_HOST: tcp://docker:2375
-    DOCKER_TLS_CERTDIR: ""
-    BUILDX_NO_DEFAULT_OCI_ARTIFACT: "true"
+    BUILDKITD_FLAGS: --oci-worker-no-process-sandbox
+    CACHE_REF: registry.ocnr.org/infra/container-cache:vllm-${CI_COMMIT_BRANCH}
+    DOCKER_CONFIG: /tmp/.docker
   timeout: 6 hours
   before_script:
   - |
-    for i in $(seq 1 30); do
-      docker info >/dev/null 2>&1 && break
-      sleep 1
-    done
-    docker login -u build-token -p "${BUILD_TOKEN}" "${CI_REGISTRY}"
-    docker buildx create --use --driver docker-container --driver-opt image=moby/buildkit:latest
+    mkdir -p /tmp/.docker
+    echo "{\"auths\":{\"${CI_REGISTRY}\":{\"auth\":\"$(echo -n "build-token:${BUILD_TOKEN}" | base64 -w0)\"}}}" > /tmp/.docker/config.json
     # VERSION carries the build flavor (e.g. 0.30.0+sm120.cu130): '+' becomes
     # '-' so the tag stays docker-valid, '.cu' becomes '-cu' in the suffix.
     export CONTAINER_TAG=$(cat VERSION | sed 's/^v//; s/^.*://; s/+/-/; s/\.cu/-cu/')
     export CACHE_REF="registry.ocnr.org/infra/container-cache:vllm-${CI_COMMIT_BRANCH}"
-    export TAG_ARGS="-t ${CI_REGISTRY_IMAGE}:${CONTAINER_TAG} -t ${CI_REGISTRY_IMAGE}:${CI_COMMIT_BRANCH}"
     # Deterministic build metadata: commit timestamp fixes buildkit's image
     # config created/history stamps and setuptools' wheel archive timestamps,
     # so a rebuild of an identical tree converges on the same digest.
     export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
   script:
   - |
-    docker buildx build \
-      --build-arg "SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}" \
-      --cache-from "type=registry,ref=${CACHE_REF}" \
-      --cache-to "type=registry,ref=${CACHE_REF},mode=max" \
-      ${TAG_ARGS} \
-      -f docker/Dockerfile \
-      --push .
+    buildctl-daemonless.sh build \
+      --frontend dockerfile.v0 \
+      --local context=$CI_PROJECT_DIR \
+      --local dockerfile=$CI_PROJECT_DIR/docker \
+      --opt build-arg:SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} \
+      --output type=image,name=${CI_REGISTRY_IMAGE}:${CONTAINER_TAG},push=true \
+      --output type=image,name=${CI_REGISTRY_IMAGE}:${CI_COMMIT_BRANCH},push=true \
+      --export-cache type=registry,ref=${CACHE_REF},mode=max \
+      --import-cache type=registry,ref=${CACHE_REF}
   rules:
   - if: $CI_PIPELINE_SOURCE == 'schedule'
     when: never
