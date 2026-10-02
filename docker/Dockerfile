@@ -1438,3 +1438,4 @@ USER vllm
 WORKDIR /home/vllm
 ENTRYPOINT ["/usr/local/bin/vllm-nonroot-entrypoint.sh"]
 #################### OPENAI API SERVER (NON-ROOT, OPT-IN) ####################
+# ci: validate buildkit migration
