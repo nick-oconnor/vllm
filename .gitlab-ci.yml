@@ -26,21 +26,54 @@ build:
     BUILDKITD_FLAGS: --oci-worker-no-process-sandbox
     CACHE_REF: registry.ocnr.org/infra/container-cache:vllm-${CI_COMMIT_BRANCH}
     DOCKER_CONFIG: /tmp/.docker
+    # Everything the image build consumes — keep in sync with the changes
+    # filter below; this drives the SOURCE_DATE_EPOCH pathspec.
+    BUILD_INPUTS: "VERSION .buildkite/check-wheel-size.py CMakeLists.txt benchmarks build_rust.sh cmake csrc docker examples pyproject.toml requirements rust-toolchain.toml rust setup.py tools use_existing_torch.py vllm"
   timeout: 6 hours
   before_script:
   - |
     mkdir -p /tmp/.docker
     echo "{\"auths\":{\"${CI_REGISTRY}\":{\"auth\":\"$(echo -n "build-token:${BUILD_TOKEN}" | base64 -w0)\"}}}" > /tmp/.docker/config.json
+    # The buildkit rootless image runs as uid 1000 while the runner checked
+    # the repo out as another uid, so git refuses every repo operation
+    # ("dubious ownership") and $(git ...) silently comes back empty — that
+    # is how an empty SOURCE_DATE_EPOCH crashed wheel packaging 24 minutes
+    # into pipeline 56260. Exempt the checkout, then fail fast if the epoch
+    # is still missing.
+    export GIT_CONFIG_GLOBAL=/tmp/gitconfig
+    git config --global --add safe.directory "$CI_PROJECT_DIR"
     # VERSION carries the build flavor (e.g. 0.30.0+sm120.cu130): '+' becomes
     # '-' so the tag stays docker-valid, '.cu' becomes '-cu' in the suffix.
     export CONTAINER_TAG=$(cat VERSION | sed 's/^v//; s/^.*://; s/+/-/; s/\.cu/-cu/')
     export CACHE_REF="registry.ocnr.org/infra/container-cache:vllm-${CI_COMMIT_BRANCH}"
-    # Deterministic build metadata: commit timestamp fixes buildkit's image
-    # config created/history stamps and setuptools' wheel archive timestamps,
-    # so a rebuild of an identical tree converges on the same digest.
-    export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+    # Deterministic build metadata: the epoch fixes buildkit's image config
+    # created/history stamps and setuptools' wheel archive timestamps, so a
+    # rebuild of identical sources converges on the same digest and the
+    # registry push becomes a no-op. Key it to the AUTHOR date of the last
+    # commit that touched the build inputs, not HEAD's committer date: docs
+    # and CI-only commits and rebases preserve author dates, so unchanged
+    # sources rebuild byte-identically instead of churning the digest. A
+    # shallow clone may not reach that commit — fall back to HEAD's
+    # committer date.
+    export SOURCE_DATE_EPOCH=$(git log -1 --format=%at -- $BUILD_INPUTS 2>/dev/null || true)
+    if [ -z "$SOURCE_DATE_EPOCH" ]; then
+      export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct 2>/dev/null || true)
+    fi
+    if [ -z "$SOURCE_DATE_EPOCH" ]; then
+      echo "FATAL: could not determine SOURCE_DATE_EPOCH; refusing to build a non-reproducible image" >&2
+      exit 1
+    fi
+    echo "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH"
   script:
   - |
+    # Builds only ever run at the branch tip (a push, or an api trigger at
+    # the tip); anything else is a retried pipeline for an older tree, and
+    # rebuilding it would push stale content over the mutable branch tags.
+    tip=$(git ls-remote origin "refs/heads/${CI_COMMIT_BRANCH}" 2>/dev/null | cut -f1 || true)
+    if [ -n "$tip" ] && [ "$tip" != "$CI_COMMIT_SHA" ]; then
+      echo "Skipping build: $CI_COMMIT_SHA is not ${CI_COMMIT_BRANCH}'s tip ($tip); a stale tree must not overwrite ${CI_REGISTRY_IMAGE}:${CI_COMMIT_BRANCH}"
+      exit 0
+    fi
     buildctl-daemonless.sh build \
       --frontend dockerfile.v0 \
       --local context=$CI_PROJECT_DIR \

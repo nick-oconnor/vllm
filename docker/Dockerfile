@@ -438,7 +438,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 # ocnr: deterministic wheel metadata — setuptools/wheel clamp archive
 # timestamps to SOURCE_DATE_EPOCH when set, so identical sources build to
-# identical wheel bytes across rebuilds (the CI passes the commit timestamp).
+# identical wheel bytes across rebuilds (the CI passes the author date of
+# the last commit that touched the build inputs). An absent epoch is fine
+# (wheel falls back to file mtimes); an empty-but-set one crashes wheel's
+# int(''), so the wheel RUNs below unset the variable when it is empty.
 ARG SOURCE_DATE_EPOCH=""
 ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
 
@@ -447,6 +450,7 @@ ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
 # AWS credentials mounted at ~/.aws/credentials for sccache S3 auth (optional)
 RUN --mount=type=cache,target=/opt/uv/cache \
     --mount=type=secret,id=aws-credentials,target=/root/.aws/credentials,required=false \
+    if [ -z "$SOURCE_DATE_EPOCH" ]; then unset SOURCE_DATE_EPOCH; fi; \
     if [ "$USE_SCCACHE" = "1" ]; then \
         if [ -n "${SCCACHE_ENDPOINT}" ]; then export SCCACHE_ENDPOINT="${SCCACHE_ENDPOINT}"; fi \
         && export CMAKE_BUILD_TYPE=Release \
@@ -465,6 +469,7 @@ ENV VLLM_TARGET_DEVICE=${vllm_target_device}
 ENV CCACHE_DIR=/root/.cache/ccache
 RUN --mount=type=cache,target=/root/.cache/ccache \
     --mount=type=cache,target=/opt/uv/cache \
+    if [ -z "$SOURCE_DATE_EPOCH" ]; then unset SOURCE_DATE_EPOCH; fi; \
     if [ "$USE_SCCACHE" != "1" ]; then \
         # Clean any existing CMake artifacts
         rm -rf .deps && \
