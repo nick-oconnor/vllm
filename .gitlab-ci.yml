@@ -4,7 +4,15 @@ workflow:
   - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 stages:
 - renovate
+- gate
 - build
+
+# Everything the image build consumes — keep in sync with the build job's
+# changes filter. The build-gate hashes these paths (plus .gitlab-ci.yml,
+# which carries the build contract) as tree/blob git ids: pure content
+# addresses, so docs commits, CI-only commits and rebases that preserve
+# content hash identically and skip the rebuild.
+.build-inputs: &build-inputs "VERSION .buildkite/check-wheel-size.py CMakeLists.txt benchmarks build_rust.sh cmake csrc docker examples pyproject.toml requirements rust-toolchain.toml rust setup.py tools use_existing_torch.py vllm"
 
 renovate:
   stage: renovate
@@ -19,16 +27,77 @@ renovate:
   - renovate ${CI_PROJECT_PATH}
   rules:
   - if: $CI_PIPELINE_SOURCE == 'schedule'
+build-gate:
+  stage: gate
+  image: ${CI_REGISTRY}/infra/docker:latest
+  variables:
+    BUILD_INPUTS: *build-inputs
+    GIT_DEPTH: "1"
+  script:
+  - |
+    # Content hash of the build inputs at a commit: tree/blob git ids per
+    # path (with a marker for paths absent at that commit), so the hash
+    # depends on content alone — not on commit SHAs or dates.
+    input_hash() {
+      for p in $BUILD_INPUTS .gitlab-ci.yml; do
+        git rev-parse -q --verify "$1:$p" 2>/dev/null || echo absent
+      done | sha256sum | cut -d' ' -f1
+    }
+    cur=$(input_hash HEAD)
+    decision="build"
+    if [ "${FORCE_BUILD:-0}" = "1" ]; then
+      decision="build: FORCE_BUILD=1"
+    else
+      # Newest successful pipeline on this branch that actually ran a build
+      # job: its commit holds the sources the registry tag was built from.
+      # (Pipeline list rows are flat objects; split on '{' to walk them.)
+      for row in $(wget -qO- --header "PRIVATE-TOKEN: ${BUILD_TOKEN}" \
+          "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/pipelines?ref=${CI_COMMIT_REF_NAME}&status=success&per_page=10" \
+          | tr '{' '\n' | grep '"status":"success"'); do
+        pid=$(printf '%s' "$row" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+        psha=$(printf '%s' "$row" | grep -o '"sha":"[0-9a-f]*"' | cut -d'"' -f4)
+        if wget -qO- --header "PRIVATE-TOKEN: ${BUILD_TOKEN}" \
+            "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/pipelines/${pid}/jobs?per_page=100" \
+            | grep -q '"name":"build"'; then
+          last_sha="$psha"
+          break
+        fi
+      done
+      if [ -z "${last_sha:-}" ]; then
+        echo "warn: no previous successful build found; building"
+      elif [ "$last_sha" = "$CI_COMMIT_SHA" ]; then
+        decision="skip: this commit's build inputs were already built ($last_sha)"
+      elif git fetch -q --depth=1 origin "$last_sha" 2>/dev/null; then
+        if [ "$cur" = "$(input_hash "$last_sha")" ]; then
+          decision="skip: build inputs unchanged since $last_sha"
+        fi
+      else
+        echo "warn: could not fetch last-built commit $last_sha; building"
+      fi
+    fi
+    echo "$decision" | tee build-decision.txt
+  artifacts:
+    paths:
+    - build-decision.txt
+    expire_in: 1 day
+  rules:
+  - if: $CI_PIPELINE_SOURCE == 'schedule'
+    when: never
+  - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
 build:
   stage: build
   image: moby/buildkit:rootless
+  needs:
+  - job: build-gate
+    artifacts: true
   variables:
     BUILDKITD_FLAGS: --oci-worker-no-process-sandbox
     CACHE_REF: registry.ocnr.org/infra/container-cache:vllm-${CI_COMMIT_BRANCH}
     DOCKER_CONFIG: /tmp/.docker
     # Everything the image build consumes — keep in sync with the changes
     # filter below; this drives the SOURCE_DATE_EPOCH pathspec.
-    BUILD_INPUTS: "VERSION .buildkite/check-wheel-size.py CMakeLists.txt benchmarks build_rust.sh cmake csrc docker examples pyproject.toml requirements rust-toolchain.toml rust setup.py tools use_existing_torch.py vllm"
+    BUILD_INPUTS: *build-inputs
   timeout: 6 hours
   before_script:
   - |
@@ -66,6 +135,14 @@ build:
     echo "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH"
   script:
   - |
+    decision=$(cat build-decision.txt 2>/dev/null || echo build)
+    case "$decision" in
+      build*) ;;
+      *)
+        echo "build-gate: $decision — nothing to do"
+        exit 0
+        ;;
+    esac
     # Builds only ever run at the branch tip (a push, or an api trigger at
     # the tip); anything else is a retried pipeline for an older tree, and
     # rebuilding it would push stale content over the mutable branch tags.
