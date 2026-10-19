@@ -136,21 +136,21 @@ git push origin main   # GitLab CI builds infra/vllm:0.32.0-sm120-cu130 (the bui
 
 Production config + `cudagraph_mode: FULL`, NVFP4 checkpoint, TP4+EP, MTP k=3,
 on the CI-equivalent image (default last stage `vllm-openai-nonroot`, run as
-`--user 2000:0`):
+`--user 2000:0`), at the deployed **gmu 0.644**:
 
 | check | result |
 |---|---|
 | Engine ready, `FLASHINFER_MLA_SPARSE_SM120` selected | PASS |
 | `pe_dim` / `block_kv==64` / trtllm-gen shape asserts | 0 occurrences |
-| auto-fit | full 1,048,576 (9.77 GiB KV, 1,196,480 tokens, 1.14x) |
+| auto-fit | full 1,048,576 (8.73 GiB KV, 1,068,443 tokens, 1.02x) |
 | greedy temp-0 (primes, spelling, 7919x311, capitals, reversal) | all correct |
 | vision (split-colour image) | "Red, blue." PASS |
 | tool call (`glm47`) | `get_weather(city=Reykjavik, unit=c)` PASS |
 | prefix-cache cached/fresh/cached @ 122k | ok / ok / ok |
-| needle @ **1,005,745 tokens** | FOUND cold (136.6 s) and warm (2.5 s), identical |
+| needle @ **1,045,745 tokens** (2,831 short of the ceiling) | FOUND cold (135.1 s) and warm (2.9 s) |
 | eviction: 5 x 502,902-token sessions, revisited after turnover | **10/10**, 2,499,840 external hit tokens, 0 preemptions |
-| accumulated decode, 10 rounds | no looping (worst 6-gram repeat 3) |
-| MTP acceptance | 5786/9480 = 61.0% |
+| accumulated decode, 10 rounds | no looping (worst *consecutive* 6-gram repeat 1). `soak.py` scores `max(consecutive, total)` and false-positives on benign prompt echo -- judge consecutive only |
+| MTP acceptance | 12812/21720 = 59.0% |
 | restart with populated per-rank autotune cache | PASS -- all 4 ranks `0 new, 126 from previous`, no deadlock; init 274 s cold -> 115 s warm, confirming the `/home/vllm` cache PVC works as mounted |
 
 The two `shm_broadcast` "No available shared memory broadcast block" notices
@@ -229,11 +229,22 @@ The `decode_800` bucket is the only one favouring 0.31 and sits inside that
 arm's own 149-194 spread. Do not quote cross-session throughput numbers as a
 baseline; re-measure both images with one harness.
 
-**It also fixes the memory regression.** Under FULL_AND_PIECEWISE the
-profiler charges a "peak activation 6.13 GiB" term and auto-fit cuts
-`max_model_len` to 732,672 at gmu 0.655. Under FULL the same gmu yields
-9.77 GiB KV / 1,196,480 tokens and the full 1M at 1.14x -- better than
-0.31's 9.17 GiB. No gmu change is needed.
+**It also fixes the memory regression, and buys a lower gmu.** Under
+FULL_AND_PIECEWISE the profiler charges a "peak activation 6.13 GiB" term
+and auto-fit cuts `max_model_len` to 732,672 at gmu 0.655. Under FULL that
+term drops to ~2.5 GiB, so the full 1M fits on far less and the deploy moves
+to **gmu 0.644** (8.75 GiB KV / 1,068,443 tokens, 1.02x), returning ~1.05
+GiB/GPU to the co-resident image-generation workload.
+
+| gmu | KV | tokens | full 1M? |
+|---|---|---|---|
+| 0.642 | 8.56 GiB | 1,045,923 | no (-4,864) |
+| 0.643 | 8.65 GiB | 1,057,406 | yes, 0.8% margin (floor) |
+| **0.644** | **8.75 GiB** | **1,068,443** | **yes, 1.02x (deployed)** |
+| 0.655 | 9.79 GiB | 1,196,480 | yes, 14% spare |
+
+KV scales ~11,600 tokens per 0.001 gmu and the accounting is deterministic
+(two independent boots at 0.655 both gave exactly 1,196,480 tokens).
 
 ## Launch (production config — mirrors k8s-gitops stage3/apps/vllm.yaml)
 
@@ -246,7 +257,7 @@ vllm serve /models/nvidia/GLM-5.3-Flash-NVFP4 \
   --max-model-len auto \
   --max-num-seqs 4 \
   --max-num-batched-tokens 8192 \
-  --gpu-memory-utilization 0.655 \
+  --gpu-memory-utilization 0.644 \
   --compilation-config '{"cudagraph_mode": "FULL"}' \
   --moe-backend flashinfer_cutlass \
   --kv-cache-dtype fp8 \
