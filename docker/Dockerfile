@@ -770,6 +770,9 @@ RUN PYTHON_VERSION_STR=$(echo ${PYTHON_VERSION} | sed 's/\.//g') && \
 RUN apt-get update -y \
     && apt-get install -y --no-install-recommends \
         software-properties-common \
+        # named install upgrades the baked trust store: the 2026-04 cuda base
+        # still trusts the compromised eMudhra chain (DSA-6572-1)
+        ca-certificates \
         # g++ alongside cuda-nvrtc-dev for FlashInfer's runtime JIT
         # (some SM120 kernels are JIT-compiled at runtime, not shipped in the wheel)
         g++ \
